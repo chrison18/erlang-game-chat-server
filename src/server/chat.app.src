@@ -1,0 +1,13 @@
+{application, chat,
+ [{description, "OTP TCP chat server"},
+  {vsn, "1.1.0"},
+  {registered, [chat_sup, role_online_server, channel_manager, channel_sup]},
+  {mod, {chat_app, []}},
+  {applications, [kernel, stdlib]},
+  {env, [{port, 5555}]},
+  {modules, [chat_app,
+             chat_sup,
+             role_online_server,
+             channel_manager,
+             channel_sup,
+             channel_server]}]}.
