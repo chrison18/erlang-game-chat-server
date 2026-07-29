@@ -18,3 +18,13 @@
 
 客户端 Shell 通过 `chat_client_manager:start_client/2` 创建客户端，并使用
 `chat_client:login/3` 登录。
+
+```erlang
+{ok, Client} = chat_client_manager:start_client("127.0.0.1", 5555).
+chat_client:login(Client, <<"alice">>, <<"secret">>).
+chat_client:list_channels(Client).
+chat_client:join_channel(Client, 2).
+chat_client:send_channel(Client, 2, <<"hello">>).
+chat_client:send_private(Client, <<"bob">>, <<"hello">>).
+chat_client:leave_channel(Client, 2).
+```
