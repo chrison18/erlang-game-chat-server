@@ -14,4 +14,7 @@
 ./scripts/start_server.sh
 ```
 
-当前已经包含根监督树、账号与在线角色 ETS、频道资料 ETS，以及 10 个固定频道进程。
+当前已经包含根监督树、账号与在线角色 ETS、10 个固定频道进程，以及基础 TCP 连接生命周期。
+
+客户端 Shell 通过 `chat_client_manager:start_client/2` 创建客户端，并使用
+`chat_client:login/3` 登录。

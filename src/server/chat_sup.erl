@@ -29,6 +29,18 @@ init([]) ->
           restart => permanent,
           shutdown => infinity,
           type => supervisor,
-          modules => [channel_sup]}
+          modules => [channel_sup]},
+        #{id => role_sup,
+          start => {role_sup, start_link, []},
+          restart => permanent,
+          shutdown => infinity,
+          type => supervisor,
+          modules => [role_sup]},
+        #{id => chat_listener,
+          start => {chat_listener, start_link, []},
+          restart => permanent,
+          shutdown => 5000,
+          type => worker,
+          modules => [chat_listener]}
     ],
     {ok, {SupFlags, ChildSpecs}}.
