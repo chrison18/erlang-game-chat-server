@@ -1,35 +1,11 @@
 -module(chat_client).
 -behaviour(gen_server).
 
--export([start_link/2,
-         login/3,
-         list_channels/1,
-         join_channel/2,
-         leave_channel/2,
-         send_channel/3,
-         send_private/3]).
+-export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_link(Host, Port) ->
     gen_server:start_link(?MODULE, [Host, Port], []).
-
-login(ClientPid, RoleName, Password) ->
-    send_command(ClientPid, {login, RoleName, Password}).
-
-list_channels(ClientPid) ->
-    send_command(ClientPid, list_channels).
-
-join_channel(ClientPid, ChannelId) ->
-    send_command(ClientPid, {join_channel, ChannelId}).
-
-leave_channel(ClientPid, ChannelId) ->
-    send_command(ClientPid, {leave_channel, ChannelId}).
-
-send_channel(ClientPid, ChannelId, Content) ->
-    send_command(ClientPid, {send_channel, ChannelId, Content}).
-
-send_private(ClientPid, TargetRoleName, Content) ->
-    send_command(ClientPid, {send_private, TargetRoleName, Content}).
 
 init([Host, Port]) ->
     Options = [binary, {packet, 4}, {active, once}],
@@ -39,8 +15,7 @@ init([Host, Port]) ->
                    status => connected,
                    role_id => undefined,
                    role_name => undefined,
-                   channel_ids => #{},
-                   last_result => undefined}};
+                   channel_ids => #{}}};
         {error, Reason} ->
             {stop, {connect_failed, Reason}}
     end.
@@ -83,14 +58,10 @@ handle_info(_Info, State) ->
 terminate(_Reason, #{socket := Socket}) ->
     gen_tcp:close(Socket).
 
-send_command(ClientPid, Command) ->
-    ClientPid ! Command,
-    ok.
-
 do_login(_RoleName, _Password, #{status := online} = State) ->
-    record_result(login, {error, already_logged_in}, State);
+    report_result(login, {error, already_logged_in}, State);
 do_login(_RoleName, _Password, #{status := logging_in} = State) ->
-    record_result(login, {error, login_in_progress}, State);
+    report_result(login, {error, login_in_progress}, State);
 do_login(RoleName, Password, State) ->
     case normalize_texts([RoleName, Password]) of
         {ok, [RoleNameBinary, PasswordBinary]} ->
@@ -100,7 +71,7 @@ do_login(RoleName, Password, State) ->
                               role_name := RoleNameBinary},
             send_packet(login, Packet, SentState, State);
         {error, Reason} ->
-            record_result(login, {error, Reason}, State)
+            report_result(login, {error, Reason}, State)
     end.
 
 do_list_channels(State) ->
@@ -113,7 +84,7 @@ do_join_channel(ChannelId, State) when is_integer(ChannelId),
     Packet = chat_client_protocol:encode_channel_join(ChannelId),
     send_packet({join_channel, ChannelId}, Packet, State, State);
 do_join_channel(_ChannelId, State) ->
-    record_result(join_channel, {error, invalid_channel_id}, State).
+    report_result(join_channel, {error, invalid_channel_id}, State).
 
 do_leave_channel(ChannelId, State) when is_integer(ChannelId),
                                         ChannelId >= 0,
@@ -121,7 +92,7 @@ do_leave_channel(ChannelId, State) when is_integer(ChannelId),
     Packet = chat_client_protocol:encode_channel_leave(ChannelId),
     send_packet({leave_channel, ChannelId}, Packet, State, State);
 do_leave_channel(_ChannelId, State) ->
-    record_result(leave_channel, {error, invalid_channel_id}, State).
+    report_result(leave_channel, {error, invalid_channel_id}, State).
 
 do_send_channel(ChannelId, Content, State)
   when is_integer(ChannelId), ChannelId >= 0, ChannelId =< 16#FFFFFFFF ->
@@ -131,10 +102,10 @@ do_send_channel(ChannelId, Content, State)
                 ChannelId, ContentBinary),
             send_packet({send_channel, ChannelId}, Packet, State, State);
         {error, Reason} ->
-            record_result(send_channel, {error, Reason}, State)
+            report_result(send_channel, {error, Reason}, State)
     end;
 do_send_channel(_ChannelId, _Content, State) ->
-    record_result(send_channel, {error, invalid_channel_id}, State).
+    report_result(send_channel, {error, invalid_channel_id}, State).
 
 do_send_private(TargetRoleName, Content, State) ->
     case normalize_texts([TargetRoleName, Content]) of
@@ -144,7 +115,7 @@ do_send_private(TargetRoleName, Content, State) ->
             send_packet({send_private, TargetRoleNameBinary},
                         Packet, State, State);
         {error, Reason} ->
-            record_result(send_private, {error, Reason}, State)
+            report_result(send_private, {error, Reason}, State)
     end.
 
 send_packet(Action, Packet, SentState, #{socket := Socket} = CurrentState) ->
@@ -152,7 +123,7 @@ send_packet(Action, Packet, SentState, #{socket := Socket} = CurrentState) ->
         ok ->
             SentState;
         {error, Reason} ->
-            record_result(Action, {error, {send_failed, Reason}}, CurrentState)
+            report_result(Action, {error, {send_failed, Reason}}, CurrentState)
     end.
 
 normalize_texts(Texts) ->
@@ -188,7 +159,7 @@ handle_server_packet(Packet, State) ->
         {ok, Response} ->
             handle_response(Response, State);
         {error, Reason} ->
-            record_result(protocol, {error, Reason}, State)
+            report_result(protocol, {error, Reason}, State)
     end.
 
 handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
@@ -196,44 +167,44 @@ handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
                      role_id := RoleId,
                      channel_ids := maps:from_list(
                          [{ChannelId, true} || ChannelId <- ChannelIds])},
-    record_result(login, Result, NewState);
+    report_result(login, Result, NewState);
 handle_response({login_result, {error, _Reason} = Result}, State) ->
     NewState = State#{status := connected,
                      role_id := undefined,
                      role_name := undefined,
                      channel_ids := #{}},
-    record_result(login, Result, NewState);
+    report_result(login, Result, NewState);
 handle_response({channel_list_result, {ok, Channels} = Result}, State) ->
     JoinedChannels = maps:from_list([
         {maps:get(channel_id, Channel), true}
      || Channel <- Channels,
         maps:get(joined, Channel)]),
-    record_result(list_channels, Result,
+    report_result(list_channels, Result,
                   State#{channel_ids := JoinedChannels});
 handle_response({channel_join_result, {ok, ChannelId} = Result},
                 #{channel_ids := ChannelIds} = State) ->
     NewState = State#{channel_ids := maps:put(ChannelId, true, ChannelIds)},
-    record_result(join_channel, Result, NewState);
+    report_result(join_channel, Result, NewState);
 handle_response({channel_join_result,
                  {error, _Reason, _ChannelId} = Result}, State) ->
-    record_result(join_channel, Result, State);
+    report_result(join_channel, Result, State);
 handle_response({channel_leave_result, {ok, ChannelId} = Result},
                 #{channel_ids := ChannelIds} = State) ->
     NewState = State#{channel_ids := maps:remove(ChannelId, ChannelIds)},
-    record_result(leave_channel, Result, NewState);
+    report_result(leave_channel, Result, NewState);
 handle_response({channel_leave_result,
                  {error, _Reason, _ChannelId} = Result}, State) ->
-    record_result(leave_channel, Result, State);
+    report_result(leave_channel, Result, State);
 handle_response({channel_send_result, Result}, State) ->
-    record_result(send_channel, Result, State);
+    report_result(send_channel, Result, State);
 handle_response({private_send_result, Result}, State) ->
-    record_result(send_private, Result, State);
+    report_result(send_private, Result, State);
 handle_response({server_error, RequestProtoId, Reason}, State) ->
-    record_result({server_error, RequestProtoId}, {error, Reason}, State).
+    report_result({server_error, RequestProtoId}, {error, Reason}, State).
 
-record_result(Action, Result, State) ->
+report_result(Action, Result, State) ->
     print_result(Action, Result),
-    State#{last_result := {Action, Result}}.
+    State.
 
 print_result(Action, Result) ->
     io:format("[~p] ~p~n", [Action, Result]).

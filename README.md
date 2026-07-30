@@ -28,6 +28,3 @@ Client ! {send_channel, 2, <<"hello">>}.
 Client ! {send_private, <<"bob">>, <<"hello">>}.
 Client ! {leave_channel, 2}.
 ```
-
-`chat_client:login/3` 等同名函数也可以使用，它们只发送对应消息并立即返回
-`ok`，不会等待服务端响应。
