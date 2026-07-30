@@ -5,12 +5,13 @@
 |日期|修改内容|
 |---|---|
 |2026\-07\-28|项目改名为 `chat`；调整服务端和客户端模块；完善登录、固定频道、私聊、ETS 数据、TCP 协议及运行流程设计。|
+|2026\-07\-30|重构客户端为普通消息驱动的独立行为进程；删除客户端业务的同步 `call`、`From`、延迟 `reply` 和请求忙碌限制；补充客户端状态、异步操作流程、断线处理及验收说明。|
 
 ## **1\. 项目目标**
 
 使用 Erlang/OTP 实现一个简单的 TCP 聊天程序。项目名为 `chat`，服务端和客户端都由本项目实现。
 
-V1\.0 只完成三个基础功能：
+V1\.1 只完成三个基础功能：
 
 - 登录
 
@@ -82,7 +83,7 @@ channel\_manager 不经过任何一条频道聊天消息。
 
 - 暂不使用 `rebar3`，通过 `erlc` 和 Shell 脚本编译、启动。
 
-- V1\.0 不增加心跳、空闲超时和没有实际用途的定时任务。
+- V1\.1 不增加心跳、空闲超时和没有实际用途的定时任务。
 
 
 
@@ -218,11 +219,15 @@ role_server -> online_roles ETS -> 目标 role_server
 |模块|类型|主要职责|
 |---|---|---|
 |`chat_client_sup`|supervisor|动态监督多个客户端进程|
-|`chat_client_manager`|普通模块|提供客户端启动、停止和查看接口|
-|`chat_client`|gen\_server|代表一个客户端用户，持有一条 TCP 长连接|
+|`chat_client_manager`|普通模块|提供客户端启动、停止和查看接口，不参与客户端业务行为|
+|`chat_client`|gen\_server|代表一个完整的客户端用户，持有一条 TCP 长连接，自主处理登录、频道操作、聊天和网络消息|
 |`chat_client_protocol`|普通模块|编码客户端请求，解码服务端结果和推送|
 
-`chat_client` 使用 `temporary`。V1\.0 只实现手动启动和操作客户端，批量客户端和自动压力测试放到后续版本。
+每个 `chat_client` 都是一个独立客户端角色，拥有自己的 Socket、连接状态、RoleId、RoleName、ChannelIds 和最近一次操作结果。Shell 或其他进程只向它发送登录、频道操作和聊天等普通消息；`chat_client` 在 `handle_info/2` 中识别消息并调用对应的 `do_*` 函数，再自行发送 TCP 请求、处理服务端响应和更新内部状态。
+
+`chat_client_manager` 只负责客户端进程的生命周期管理，不替客户端执行登录或聊天行为，也不为每个客户端增加额外的行为驱动进程。`chat_client` 使用 `temporary`，连接结束后不自动重启。
+
+V1\.1 只提供手动创建和操作客户端。后续批量客户端和自动压力测试仍复用同一个 `chat_client`：批量启动后向各客户端发送测试模式消息，由客户端通过 `handle_info/2` 和内部函数执行自己的测试行为。
 
 
 
@@ -301,7 +306,7 @@ ets:new(online_roles, [
 
 - RoleName 已在线时返回 `already_online`。
 
-- V1\.0 不持久化 ETS，服务端重启后账号数据重新开始。
+- V1\.1 不持久化 ETS，服务端重启后账号数据重新开始。
 
     
 
@@ -411,21 +416,33 @@ gen_server:cast(TargetRolePid, {
 
 ### 6\.3 客户端接口
 
+客户端生命周期接口：
+
 |接口|返回值|
 |---|---|
 |`chat_client_manager:start_client(Host, Port)`|`{ok, ClientPid} | {error, Reason}`|
 |`chat_client_manager:stop_client(ClientPid)`|`ok`|
 |`chat_client_manager:list_clients()`|`[ClientPid]`|
-|`chat_client:login(ClientPid, RoleName, Password)`|`{ok, RoleId, ChannelIds} | {error, Reason}`|
-|`chat_client:list_channels(ClientPid)`|`{ok, ChannelList} | {error, Reason}`|
-|`chat_client:join_channel(ClientPid, ChannelId)`|`{ok, ChannelId} | {error, Reason}`|
-|`chat_client:leave_channel(ClientPid, ChannelId)`|`{ok, ChannelId} | {error, Reason}`|
-|`chat_client:send_channel(ClientPid, ChannelId, Content)`|`{ok, ChannelId} | {error, Reason}`|
-|`chat_client:send_private(ClientPid, TargetName, Content)`|`{ok, TargetName} | {error, target_offline}`|
 
-需要服务端结果时，`chat_client` 在 `handle_call` 中发送 TCP 请求并暂存 `From`，收到结果报文后调用 `gen_server:reply/2`。协议没有 `RequestId`，所以每个客户端同时只允许一个等待结果的请求，新请求返回 `{error, request_busy}`。
+客户端业务操作使用普通进程消息：
 
-频道发送等待 `2008`，私聊发送等待 `3002`。客户端收到 `2009` 频道推送或 `3003` 私聊推送时直接打印。
+|普通消息|辅助函数|`chat_client` 内部处理|
+|---|---|---|
+|`{login, RoleName, Password}`|`chat_client:login(ClientPid, RoleName, Password)`|`do_login/3`|
+|`list_channels`|`chat_client:list_channels(ClientPid)`|`do_list_channels/1`|
+|`{join_channel, ChannelId}`|`chat_client:join_channel(ClientPid, ChannelId)`|`do_join_channel/2`|
+|`{leave_channel, ChannelId}`|`chat_client:leave_channel(ClientPid, ChannelId)`|`do_leave_channel/2`|
+|`{send_channel, ChannelId, Content}`|`chat_client:send_channel(ClientPid, ChannelId, Content)`|`do_send_channel/3`|
+|`{send_private, TargetName, Content}`|`chat_client:send_private(ClientPid, TargetName, Content)`|`do_send_private/3`|
+|`stop`|`chat_client_manager:stop_client(ClientPid)`|结束客户端进程并关闭 Socket|
+
+Shell 可以直接使用 `ClientPid ! Message`，也可以调用表中的辅助函数。辅助函数只发送对应的普通消息并立即返回 `ok`；这里的 `ok` 不表示 TCP 请求已经完成，也不表示服务端业务处理成功。
+
+`chat_client` 在 `handle_info/2` 中处理业务消息并发送 TCP 请求。服务端结果稍后以 `{tcp, Socket, Packet}` 进入同一个客户端邮箱，客户端解码后自行更新连接状态、RoleId、RoleName、ChannelIds 和最近一次操作结果，并在当前版本中打印结果。
+
+客户端不再通过 `handle_call/3` 接收业务操作，不保存调用者 `From`，也不使用 `gen_server:reply/2`。由于没有外部同步调用者等待结果，客户端不需要使用 `pending` 把 TCP 响应关联回某次 `gen_server:call`，也不再限制为同时只能存在一个等待回复的业务操作。
+
+客户端收到 `2008` 或 `3002` 时记录并打印发送结果；收到 `2009` 频道推送或 `3003` 私聊推送时直接打印消息。后续自动测试模式可以在处理结果后向自己发送下一步行为消息。
 
 
 
@@ -433,7 +450,7 @@ gen_server:cast(TargetRolePid, {
 
 ### 7\.1 外层格式和字段
 
-监听和连接 Socket 使用 `[binary, {packet, 4}, {active, false}]`。完成 Socket 控制权转交后，`role_server` 改为 `{active, once}`。网络格式为：
+服务端监听和接收 Socket 时使用 `[binary, {packet, 4}, {active, false}]`。完成 Socket 控制权转交后，`role_server` 改为 `{active, once}`；客户端连接 Socket 从创建时就使用 `{active, once}`。网络格式为：
 
 ```Erlang
 <<PacketLength:32, ProtoId:16, Data/binary>>
@@ -578,49 +595,71 @@ gen_server:cast(TargetRolePid, {
 
 ### 8\.3 登录
 
-1. `role_server` 收到 `1001`，解码出 `RoleName` 和 `Password`，再 `call role_online_server`。
+1. Shell 或其他进程向客户端发送 `{login, RoleName, Password}` 普通消息。`chat_client:login/3` 只是发送同一条消息并立即返回 `ok`。
 
-2. 新 RoleName 自动创建账号并分配 RoleId；已有账号检查密码和在线状态。
+2. `chat_client` 在 `handle_info/2` 中收到登录消息，调用 `do_login/3` 编码并发送 `1001`，然后把自己的连接状态更新为 `logging_in`。客户端进程不等待服务端结果，继续处理邮箱中的其他消息。
 
-3. 登录成功后，`role_online_server` 写入 `online_roles` 并监控 RolePid。
+3. 服务端 `role_server` 收到 `1001`，解码出 `RoleName` 和 `Password`，再 `call role_online_server`。
 
-4. `role_server` 加入必须进入的 `main`，再随机加入 1 到 3 个不同的公共频道。
+4. 新 RoleName 自动创建账号并分配 RoleId；已有账号检查密码和在线状态。
 
-5. `role_server` 把 RoleId、RoleName 和 ChannelIds 写入自己的进程字典，并返回 `1002`。
+5. 登录成功后，`role_online_server` 写入 `online_roles` 并监控 RolePid。
 
-6. 登录失败时返回对应结果码，TCP 连接保留，客户端可以再次登录。
+6. `role_server` 加入必须进入的 `main`，再随机加入 1 到 3 个不同的公共频道。
+
+7. `role_server` 把 RoleId、RoleName 和 ChannelIds 写入自己的进程字典，并返回 `1002`。
+
+8. `chat_client` 收到 `{tcp, Socket, Packet}` 后解码 `1002`。登录成功时把状态更新为 `online`，保存 RoleId、RoleName 和 ChannelIds，并记录、打印登录结果。
+
+9. 登录失败时，服务端通过 `1002` 返回对应结果码并保留 TCP 连接。客户端把状态恢复为 `connected`，清理未成功的角色数据并记录、打印错误，之后可以再次接收登录消息。
+
+登录结果始终由 `chat_client` 自己处理，不通过 `gen_server:reply/2` 返回给发送登录消息的进程。每处理完一条 TCP 报文，客户端都会重新设置 `{active, once}`，继续等待下一条网络消息。
 
     
 
 ### 8\.4 频道操作和频道聊天
 
-- 查询频道：`role_server` 读取 `channel_info`，结合自己的 `channel_ids` 返回全部 10 个频道及加入状态。
+- 查询频道：Shell 向客户端发送 `list_channels`。`chat_client` 调用 `do_list_channels/1` 发送 `2001`；`role_server` 读取 `channel_info`，结合自己的 `channel_ids` 通过 `2002` 返回全部 10 个频道及加入状态。客户端收到成功结果后，按频道列表中的 `joined` 字段重建自己的 ChannelIds，并记录、打印频道列表。
 
-- 加入频道：`role_server` 取得 ChannelPid 并 `call channel_server`；成功后把 ChannelId 加入自己的 `channel_ids`。
+- 加入频道：Shell 向客户端发送 `{join_channel, ChannelId}`。`chat_client` 调用 `do_join_channel/2` 发送 `2003`；`role_server` 取得 ChannelPid 并 `call channel_server`，通过 `2004` 返回结果。服务端和客户端都只在加入成功时把 ChannelId 加入自己的频道状态，失败时保留原状态并记录错误。
 
-- 退出频道：`role_server` 取得 ChannelPid 并 `call channel_server`；成功后从自己的 `channel_ids` 删除 ChannelId。`main` 不允许退出。
+- 退出频道：Shell 向客户端发送 `{leave_channel, ChannelId}`。`chat_client` 调用 `do_leave_channel/2` 发送 `2005`；`role_server` 取得 ChannelPid 并 `call channel_server`，通过 `2006` 返回结果。服务端和客户端都只在退出成功时从自己的频道状态中删除 ChannelId；`main` 不允许退出，失败时保留原状态并记录错误。
 
-- 发送频道消息：`role_server` 先检查自己的 `channel_ids`，再 `call channel_server`。`channel_server` 二次检查成员身份，向本频道成员的 RolePid 发送 cast，并返回成功或错误。发送方收到 `2008`，频道成员收到 `2009`。
+- 发送频道消息：Shell 向客户端发送 `{send_channel, ChannelId, Content}`。`chat_client` 调用 `do_send_channel/3` 发送 `2007`；`role_server` 先检查自己的 `channel_ids`，再 `call channel_server`。`channel_server` 二次检查成员身份，向本频道成员的 RolePid 发送 cast，并返回成功或错误。发送方客户端收到 `2008` 后记录、打印发送结果，频道成员客户端收到 `2009` 后直接打印频道消息。
 
-频道的加入、退出和消息发送都不经过 `channel_manager`。每个 `channel_server` 独立维护自己的成员 Map，因此不同频道可以分别处理消息。
+以上操作都以普通消息进入 `chat_client:handle_info/2`。客户端发送 TCP 请求后不等待结果，可以继续处理邮箱中的其他客户端命令和频道推送；对应的服务端结果到达后，再由客户端自己的 `handle_info/2` 更新状态或记录结果。
+
+频道的加入、退出和消息发送都不经过 `channel_manager`。每个 `channel_server` 独立维护自己的成员 Map，因此不同频道可以分别处理消息。发送者本身属于目标频道时，也会像其他成员一样收到 `2009` 推送。
 
 
 
 ### 8\.5 私聊
 
-1. 发送方 `role_server` 收到 `3001`，按 `TargetRoleName` 读取 `online_roles`。
+1. Shell 向发送方客户端发送 `{send_private, TargetRoleName, Content}`。`chat_client` 在 `handle_info/2` 中调用 `do_send_private/3`，编码并发送 `3001`，然后继续处理自己的邮箱，不等待私聊结果。
 
-2. 找到目标 RolePid 后，向目标 `role_server` cast 结构化私聊消息。
+2. 发送方 `role_server` 收到 `3001`，按 `TargetRoleName` 直接读取 `online_roles` ETS，不经过 `role_online_server` 的消息队列。
 
-3. 目标 `role_server` 编码并通过自己的 Socket 发送 `3003`。
+3. 找到目标 RolePid 后，发送方 `role_server` 向目标 `role_server` cast 结构化私聊消息，并通过自己的 Socket 向发送方客户端返回 `3002` 成功结果。
 
-4. 发送方 `role_server` 返回 `3002`；目标不在线时返回 `target_offline`。
+4. 目标 `role_server` 收到 cast 后编码 `3003`，通过自己持有的 Socket 推送给目标客户端。目标 `chat_client` 收到并解码 `3003` 后直接打印私聊消息。
+
+5. 发送方 `chat_client` 收到并解码 `3002` 后，记录、打印本次私聊发送结果。这个结果由发送方客户端自己处理，不回复最初发送普通消息的 Shell 进程。
+
+6. 目标不在线时，发送方 `role_server` 通过 `3002` 返回 `target_offline`，不会产生 `3003` 推送。发送方客户端记录、打印错误，并继续处理后续消息。
 
     
 
 ### 8\.6 断开连接
 
-Socket 关闭后，对应的 `role_server` 结束。`role_online_server` 收到监控 `DOWN` 后删除该玩家的在线记录；各个 `channel_server` 分别收到自己的监控 `DOWN`，从成员 Map 中删除该 RoleId。`channel_manager` 不参与成员清理。玩家重新登录时会再次加入 `main` 和随机公共频道。
+1. 主动停止客户端时，Shell 可以直接发送 `ClientPid ! stop`，也可以调用 `chat_client_manager:stop_client/1` 发送同一条普通消息。
+
+2. `chat_client` 在 `handle_info/2` 中收到 `stop` 后正常结束，并在终止过程中关闭自己持有的 Socket。发生 `{tcp_closed, Socket}` 或 `{tcp_error, Socket, Reason}` 时，客户端也会结束；客户端进程退出后不会由 `chat_client_sup` 自动重启。
+
+3. 客户端 Socket 关闭后，服务端对应的 `role_server` 收到断开消息并结束。Socket 或进程异常退出时也通过同一套监控清理机制收口。
+
+4. `role_online_server` 收到监控 `DOWN` 后删除该玩家的 `online_roles` 记录；各个 `channel_server` 分别收到自己的监控 `DOWN`，从成员 Map 中删除该 RoleId。账号表 `role_accounts` 不删除，`channel_manager` 不参与在线状态或频道成员清理。
+
+5. 玩家再次连接时会创建新的 `chat_client` 和 `role_server`。使用原账号登录会复用原 RoleId，并重新加入 `main` 和随机公共频道。
 
 
 
@@ -634,33 +673,61 @@ scripts/start_server.sh -> application:start(chat)
 scripts/start_client.sh -> chat_client_sup:start_link()
 ```
 
-服务端不会自动创建测试客户端。客户端 Shell 使用 `chat_client_manager:start_client/2` 创建一个或多个客户端。
+先在一个终端编译并启动服务端：
+
+```Bash
+./scripts/compile.sh
+./scripts/start_server.sh
+```
+
+再在另一个终端启动客户端 Shell：
+
+```Bash
+./scripts/start_client.sh
+```
+
+服务端不会自动创建测试客户端。客户端 Shell 使用 `chat_client_manager:start_client/2` 创建一个或多个独立客户端，再通过普通消息触发客户端行为：
+
+```Erlang
+{ok, Client} = chat_client_manager:start_client("127.0.0.1", 5555).
+Client ! {login, <<"alice">>, <<"secret">>}.
+Client ! list_channels.
+Client ! {join_channel, 2}.
+Client ! {send_channel, 2, <<"hello">>}.
+Client ! {send_private, <<"bob">>, <<"hello">>}.
+Client ! {leave_channel, 2}.
+Client ! stop.
+```
+
+消息发送表达式立即结束，服务端业务结果稍后由 `chat_client` 自己处理并打印。手动操作时，应先观察上一条操作的异步结果，再决定下一条命令。
+
+也可以使用 `chat_client:login/3`、`chat_client:list_channels/1` 等辅助函数。辅助函数只是发送相同的普通消息并返回 `ok`，不会同步返回服务端业务结果。
 
 
 
-### 9\.2 V1\.0 验收
+### 9\.2 V1\.1 验收
 
 1. 服务端正常启动 `role_online_server`、`channel_manager`、`main` 和 9 个公共频道进程，并监听 TCP 端口。
 
-2. 新 RoleName 第一次登录时自动创建账号并取得 RoleId；已有账号使用原 RoleId 登录。
+2. Shell 向客户端发送登录消息后立即返回；客户端稍后处理 `1002`。新 RoleName 第一次登录时自动创建账号并取得 RoleId，断开后使用已有账号登录时复用原 RoleId。
 
-3. 密码错误返回 `invalid_login` 并允许重试；同一账号重复在线返回 `already_online`。
+3. 密码错误时客户端异步记录、打印 `invalid_login` 并保持连接，之后可以再次接收登录消息；同一账号重复在线时记录、打印 `already_online`。
 
-4. 登录成功后，角色一定加入 `main`，并随机加入 1 到 3 个不同的公共频道。
+4. 登录成功后，服务端角色一定加入 `main` 和 1 到 3 个不同的随机公共频道；客户端收到 `1002` 后进入 `online` 状态，并保存相同的 RoleId、RoleName 和 ChannelIds。
 
-5. 客户端能查询全部频道，能加入和退出公共频道，但不能退出 `main`。
+5. 向客户端发送频道查询、加入和退出消息后，客户端能异步处理对应结果；查询返回全部 10 个频道，公共频道可以加入和退出，`main` 不能退出，客户端与服务端的 ChannelIds 保持一致。
 
-6. 已加入成员发送频道消息时收到 `2008` 成功结果，目标频道成员收到 `2009`，非成员收不到。
+6. 向已加入频道的客户端发送频道聊天消息后，发送方客户端处理 `2008` 成功结果，目标频道成员客户端处理 `2009` 推送，非成员收不到推送。
 
-7. 未加入频道时发送消息返回 `not_joined`，发送者本人属于频道成员时也能收到频道推送。
+7. 未加入频道时发送消息，发送方客户端异步记录、打印 `not_joined`；发送者本人属于频道成员时也能收到 `2009` 推送。
 
-8. 客户端能按 RoleName 私聊在线角色；目标收到 `3003`，发送方收到 `3002`。目标离线时返回 `target_offline`。
+8. 向客户端发送私聊消息后，在线目标客户端处理 `3003` 推送，发送方客户端处理 `3002` 结果；目标离线时发送方异步记录、打印 `target_offline`。
 
-9. 客户端断线后，`online_roles` 在线记录和各频道中的成员记录都被清理，其他在线客户端不受影响。
+9. 连续向同一个客户端发送多个普通业务消息时，消息由客户端邮箱依次接收，不会因为前一个 TCP 结果尚未到达而拒绝新消息；客户端自行处理各类服务端结果和推送。客户端停止或断线后，`online_roles` 在线记录和各频道成员记录都被清理，其他在线客户端不受影响。
 
     
 
-### 9\.3 V1\.0 限制
+### 9\.3 V1\.1 限制
 
 - 不实现独立注册接口；新账号只在第一次登录时自动创建。
 
@@ -670,11 +737,16 @@ scripts/start_client.sh -> chat_client_sup:start_link()
 
 - 不实现地图、移动、AOI、地图聊天和周围聊天。
 
-- 不实现自动压力测试、心跳和空闲超时。
+- 不实现自动批量创建客户端、自动压力测试、结果汇总、心跳和空闲超时。
+
+- 当前客户端只提供手动行为消息，不实现测试模式切换、随机消息循环和发送频率控制。
+
+- 客户端断开后不自动重连，必须重新创建客户端进程。
+
+- TCP 业务协议不包含 RequestId，客户端不向外部提供逐请求同步返回或回调关联。
 
 - 只要求基础业务跑通，不处理服务进程崩溃后的完整业务状态恢复。
 
 
 
-后续版本再增加批量客户端、在线进程信息打印、地图和 AOI 等最终考核功能。
-
+后续版本再增加批量客户端、客户端内部测试模式、统计结果、在线进程信息打印、地图和 AOI 等最终考核功能。批量测试仍由每个 `chat_client` 执行自己的行为，不为每个客户端增加额外的行为驱动进程。

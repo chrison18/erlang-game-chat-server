@@ -6,7 +6,8 @@ start_client(Host, Port) ->
     chat_client_sup:start_client(Host, Port).
 
 stop_client(ClientPid) ->
-    gen_server:stop(ClientPid).
+    ClientPid ! stop,
+    ok.
 
 list_clients() ->
     [Pid

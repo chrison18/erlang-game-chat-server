@@ -58,17 +58,19 @@ login_role(RolePid, RoleName, Password,
             }),
             NewState = add_online_role(RolePid, RoleName, NextRoleId, State),
             {reply, {ok, NextRoleId},
-             NewState#{next_role_id := NextRoleId + 1}};
+            NewState#{next_role_id := NextRoleId + 1}};
         [#role_account{role_id = RoleId, password = Password}] ->
             case ets:member(online_roles, RoleName) of
+                % 账号在线
                 true ->
                     {reply, {error, already_online}, State};
+                % 账号存在但离线
                 false ->
                     NewState = add_online_role(RolePid, RoleName, RoleId, State),
                     {reply, {ok, RoleId}, NewState}
             end;
         [#role_account{}] ->
-            {reply, {error, invalid_login}, State}
+            {reply, {error, invalid_login}, State} % 密码错误
     end.
 
 add_online_role(RolePid, RoleName, RoleId,
