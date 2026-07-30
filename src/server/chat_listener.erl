@@ -51,7 +51,8 @@ handoff_socket(Socket) ->
                     ok;
                 {error, Reason} ->
                     gen_tcp:close(Socket),
-                    gen_server:stop(RolePid, {socket_handoff_failed, Reason})
+                    gen_server:stop(
+                        RolePid, {socket_handoff_failed, Reason}, 5000)
             end;
         {error, _Reason} ->
             gen_tcp:close(Socket)

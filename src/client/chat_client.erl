@@ -214,13 +214,15 @@ handle_response({channel_join_result, {ok, ChannelId} = Result},
                 #{channel_ids := ChannelIds} = State) ->
     NewState = State#{channel_ids := maps:put(ChannelId, true, ChannelIds)},
     record_result(join_channel, Result, NewState);
-handle_response({channel_join_result, {error, _Reason} = Result}, State) ->
+handle_response({channel_join_result,
+                 {error, _Reason, _ChannelId} = Result}, State) ->
     record_result(join_channel, Result, State);
 handle_response({channel_leave_result, {ok, ChannelId} = Result},
                 #{channel_ids := ChannelIds} = State) ->
     NewState = State#{channel_ids := maps:remove(ChannelId, ChannelIds)},
     record_result(leave_channel, Result, NewState);
-handle_response({channel_leave_result, {error, _Reason} = Result}, State) ->
+handle_response({channel_leave_result,
+                 {error, _Reason, _ChannelId} = Result}, State) ->
     record_result(leave_channel, Result, State);
 handle_response({channel_send_result, Result}, State) ->
     record_result(send_channel, Result, State);

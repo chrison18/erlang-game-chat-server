@@ -144,36 +144,36 @@ decode_channel_type(ChannelType) -> {unknown, ChannelType}.
 
 decode_channel_join_result(?RESULT_SUCCESS, ChannelId) ->
     {ok, ChannelId};
-decode_channel_join_result(?CHANNEL_JOIN_RESULT_INVALID_CHANNEL, _ChannelId) ->
-    {error, invalid_channel};
-decode_channel_join_result(?CHANNEL_JOIN_RESULT_ALREADY_JOINED, _ChannelId) ->
-    {error, already_joined};
-decode_channel_join_result(ResultCode, _ChannelId) ->
-    {error, {unknown_result, ResultCode}}.
+decode_channel_join_result(?CHANNEL_JOIN_RESULT_INVALID_CHANNEL, ChannelId) ->
+    {error, invalid_channel, ChannelId};
+decode_channel_join_result(?CHANNEL_JOIN_RESULT_ALREADY_JOINED, ChannelId) ->
+    {error, already_joined, ChannelId};
+decode_channel_join_result(ResultCode, ChannelId) ->
+    {error, {unknown_result, ResultCode}, ChannelId}.
 
 decode_channel_leave_result(?RESULT_SUCCESS, ChannelId) ->
     {ok, ChannelId};
-decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_INVALID_CHANNEL, _ChannelId) ->
-    {error, invalid_channel};
-decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_NOT_JOINED, _ChannelId) ->
-    {error, not_joined};
-decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_CANNOT_LEAVE_MAIN, _ChannelId) ->
-    {error, cannot_leave_main};
-decode_channel_leave_result(ResultCode, _ChannelId) ->
-    {error, {unknown_result, ResultCode}}.
+decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_INVALID_CHANNEL, ChannelId) ->
+    {error, invalid_channel, ChannelId};
+decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_NOT_JOINED, ChannelId) ->
+    {error, not_joined, ChannelId};
+decode_channel_leave_result(?CHANNEL_LEAVE_RESULT_CANNOT_LEAVE_MAIN, ChannelId) ->
+    {error, cannot_leave_main, ChannelId};
+decode_channel_leave_result(ResultCode, ChannelId) ->
+    {error, {unknown_result, ResultCode}, ChannelId}.
 
 decode_channel_send_result(?RESULT_SUCCESS, ChannelId) ->
     {ok, ChannelId};
-decode_channel_send_result(?CHANNEL_SEND_RESULT_INVALID_CHANNEL, _ChannelId) ->
-    {error, invalid_channel};
-decode_channel_send_result(?CHANNEL_SEND_RESULT_NOT_JOINED, _ChannelId) ->
-    {error, not_joined};
-decode_channel_send_result(ResultCode, _ChannelId) ->
-    {error, {unknown_result, ResultCode}}.
+decode_channel_send_result(?CHANNEL_SEND_RESULT_INVALID_CHANNEL, ChannelId) ->
+    {error, invalid_channel, ChannelId};
+decode_channel_send_result(?CHANNEL_SEND_RESULT_NOT_JOINED, ChannelId) ->
+    {error, not_joined, ChannelId};
+decode_channel_send_result(ResultCode, ChannelId) ->
+    {error, {unknown_result, ResultCode}, ChannelId}.
 
 decode_private_send_result(?RESULT_SUCCESS, TargetRoleName) ->
     {ok, TargetRoleName};
-decode_private_send_result(?PRIVATE_SEND_RESULT_TARGET_OFFLINE, _TargetRoleName) ->
-    {error, target_offline};
-decode_private_send_result(ResultCode, _TargetRoleName) ->
-    {error, {unknown_result, ResultCode}}.
+decode_private_send_result(?PRIVATE_SEND_RESULT_TARGET_OFFLINE, TargetRoleName) ->
+    {error, target_offline, TargetRoleName};
+decode_private_send_result(ResultCode, TargetRoleName) ->
+    {error, {unknown_result, ResultCode}, TargetRoleName}.
