@@ -21,6 +21,6 @@
              chat_listener,
              chat_server_protocol,
              chat_client_sup,
-             chat_client_manager,
+             client,
              chat_client,
              chat_client_protocol]}]}.

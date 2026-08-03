@@ -16,15 +16,12 @@
 
 当前已经包含根监督树、账号与在线角色 ETS、10 个固定频道进程，以及基础 TCP 连接生命周期。
 
-客户端 Shell 通过 `chat_client_manager:start_client/2` 创建客户端。Shell 只向
-客户端发送行为消息，登录、频道操作、TCP 响应和状态更新都由客户端进程处理。
+客户端 Shell 通过 `client` 模块按 ClientId 操作客户端。每个客户端创建后使用
+`client_N` 作为账号名、`123456` 作为密码自动登录。登录成功后，每个客户端
+每隔 1000ms 自动向 `main` 频道发送一条消息。
 
 ```erlang
-{ok, Client} = chat_client_manager:start_client("127.0.0.1", 5555).
-Client ! {login, <<"alice">>, <<"secret">>}.
-Client ! list_channels.
-Client ! {join_channel, 2}.
-Client ! {send_channel, 2, <<"hello">>}.
-Client ! {send_private, <<"bob">>, <<"hello">>}.
-Client ! {leave_channel, 2}.
+{ok, 2} = client:start_client(1, 2).
+ok = client:send_channel(1, 1, <<"hello">>).
+ok = client:send_private(1, 2, <<"hello">>).
 ```

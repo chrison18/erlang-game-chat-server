@@ -6,6 +6,7 @@
 |---|---|
 |2026\-07\-28|项目改名为 `chat`；调整服务端和客户端模块；完善登录、固定频道、私聊、ETS 数据、TCP 协议及运行流程设计。|
 |2026\-07\-30|重构客户端为普通消息驱动的独立行为进程；删除客户端业务的同步 `call`、`From`、延迟 `reply`、请求忙碌限制和业务辅助函数；补充客户端状态、异步操作流程、断线处理及验收说明。|
+|2026\-08\-03|将 `chat_client_manager` 改为按 ClientId 管理客户端的 `client`；增加范围创建、频道发送和按 ClientId 私聊接口；客户端登录后自动定时向 `main` 发送消息。|
 
 ## **1\. 项目目标**
 
@@ -106,7 +107,7 @@ chat/
 │   │   └── channel_server.erl
 │   └── client/
 │       ├── chat_client_sup.erl
-│       ├── chat_client_manager.erl
+│       ├── client.erl
 │       ├── chat_client.erl
 │       └── chat_client_protocol.erl
 ├── include/
@@ -218,16 +219,16 @@ role_server -> online_roles ETS -> 目标 role_server
 
 |模块|类型|主要职责|
 |---|---|---|
-|`chat_client_sup`|supervisor|动态监督多个客户端进程|
-|`chat_client_manager`|普通模块|提供客户端启动、停止和查看接口，不参与客户端业务行为|
+|`chat_client_sup`|supervisor|监督 `client` 管理进程和动态客户端进程|
+|`client`|gen\_server|维护 ClientId 与客户端 PID 的对应关系，提供范围创建、频道发送和私聊接口|
 |`chat_client`|gen\_server|代表一个完整的客户端用户，持有一条 TCP 长连接，自主处理登录、频道操作、聊天和网络消息|
 |`chat_client_protocol`|普通模块|编码客户端请求，解码服务端结果和推送|
 
 每个 `chat_client` 都是一个独立客户端角色，拥有自己的 Socket、连接状态、RoleId、RoleName 和 ChannelIds。Shell 或其他进程只向它发送登录、频道操作和聊天等普通消息；`chat_client` 在 `handle_info/2` 中识别消息并调用对应的 `do_*` 函数，再自行发送 TCP 请求、处理服务端响应和更新内部状态。
 
-`chat_client_manager` 只负责客户端进程的生命周期管理，不替客户端执行登录或聊天行为，也不为每个客户端增加额外的行为驱动进程。`chat_client` 使用 `temporary`，连接结束后不自动重启。
+`client` 只负责 ClientId 查找和客户端生命周期管理。它找到客户端 PID 后发送普通消息，不替客户端编码协议或处理聊天行为，也不为每个客户端增加额外的行为进程。`chat_client` 使用 `temporary`，连接结束后不自动重启。
 
-V1\.1 只提供手动创建和操作客户端。后续批量客户端和自动压力测试仍复用同一个 `chat_client`：批量启动后向各客户端发送测试模式消息，由客户端通过 `handle_info/2` 和内部函数执行自己的测试行为。
+调用 `client:start_client(StartId, EndId)` 可以按闭区间批量创建客户端。每个 ClientId 对应一个 `chat_client`，账号名为 `client_N`，密码固定为 `123456`，创建后自动发送登录消息。登录成功后，客户端使用 `send_after` 每隔 1000ms 向自己发送一次自动频道动作；每次动作完成后再安排下一次，不增加行为进程。
 
 
 
@@ -416,27 +417,23 @@ gen_server:cast(TargetRolePid, {
 
 ### 6\.3 客户端接口
 
-客户端生命周期接口：
+客户端对外接口：
 
 |接口|返回值|
 |---|---|
-|`chat_client_manager:start_client(Host, Port)`|`{ok, ClientPid} | {error, Reason}`|
-|`chat_client_manager:stop_client(ClientPid)`|`ok`|
-|`chat_client_manager:list_clients()`|`[ClientPid]`|
+|`client:start_client(StartId, EndId)`|`{ok, Count} | {error, Reason}`|
+|`client:send_channel(ClientId, ChannelId, Content)`|`ok | {error, Reason}`|
+|`client:send_private(SenderId, TargetId, Content)`|`ok | {error, Reason}`|
 
-客户端业务操作使用普通进程消息：
+`client` 找到对应 PID 后使用以下内部消息驱动 `chat_client`：
 
-|普通消息|`chat_client` 内部处理|
+|对外接口|内部消息|
 |---|---|
-|`{login, RoleName, Password}`|`do_login/3`|
-|`list_channels`|`do_list_channels/1`|
-|`{join_channel, ChannelId}`|`do_join_channel/2`|
-|`{leave_channel, ChannelId}`|`do_leave_channel/2`|
-|`{send_channel, ChannelId, Content}`|`do_send_channel/3`|
-|`{send_private, TargetName, Content}`|`do_send_private/3`|
-|`stop`|结束客户端进程并关闭 Socket|
+|`start_client/2`|`{login, RoleName, Password}`|
+|`send_channel/3`|`{send_channel, ChannelId, Content}`|
+|`send_private/3`|`{send_private, TargetRoleName, Content}`|
 
-Shell 或其他进程直接使用 `ClientPid ! Message` 触发客户端行为。消息发送表达式立即返回，不表示 TCP 请求已经完成，也不表示服务端业务处理成功。客户端不额外提供只用于转发这些消息的业务辅助函数。
+`send_channel/3` 或 `send_private/3` 返回 `ok`，只表示消息已经交给对应客户端，不表示 TCP 请求或服务端业务已经成功。
 
 `chat_client` 在 `handle_info/2` 中处理业务消息并发送 TCP 请求。服务端结果稍后以 `{tcp, Socket, Packet}` 进入同一个客户端邮箱，客户端解码后自行更新连接状态、RoleId、RoleName 和 ChannelIds，并在当前版本中打印结果。
 
@@ -625,7 +622,7 @@ Shell 或其他进程直接使用 `ClientPid ! Message` 触发客户端行为。
 
 - 退出频道：Shell 向客户端发送 `{leave_channel, ChannelId}`。`chat_client` 调用 `do_leave_channel/2` 发送 `2005`；`role_server` 取得 ChannelPid 并 `call channel_server`，通过 `2006` 返回结果。服务端和客户端都只在退出成功时从自己的频道状态中删除 ChannelId；`main` 不允许退出，失败时保留原状态并打印错误。
 
-- 发送频道消息：Shell 向客户端发送 `{send_channel, ChannelId, Content}`。`chat_client` 调用 `do_send_channel/3` 发送 `2007`；`role_server` 先检查自己的 `channel_ids`，再 `call channel_server`。`channel_server` 二次检查成员身份，向本频道成员的 RolePid 发送 cast，并返回成功或错误。发送方客户端收到 `2008` 后打印发送结果，频道成员客户端收到 `2009` 后直接打印频道消息。
+- 发送频道消息：调用 `client:send_channel(ClientId, ChannelId, Content)` 后，`client` 找到对应客户端并发送内部消息。`chat_client` 调用 `do_send_channel/3` 发送 `2007`；`role_server` 先检查自己的 `channel_ids`，再 `call channel_server`。发送方客户端收到 `2008` 后打印结果，频道成员客户端收到 `2009` 后打印频道消息。
 
 以上操作都以普通消息进入 `chat_client:handle_info/2`。客户端发送 TCP 请求后不等待结果，可以继续处理邮箱中的其他客户端命令和频道推送；对应的服务端结果到达后，再由客户端自己的 `handle_info/2` 更新状态并打印结果。
 
@@ -635,7 +632,7 @@ Shell 或其他进程直接使用 `ClientPid ! Message` 触发客户端行为。
 
 ### 8\.5 私聊
 
-1. Shell 向发送方客户端发送 `{send_private, TargetRoleName, Content}`。`chat_client` 在 `handle_info/2` 中调用 `do_send_private/3`，编码并发送 `3001`，然后继续处理自己的邮箱，不等待私聊结果。
+1. 调用 `client:send_private(SenderId, TargetId, Content)` 后，`client` 找到发送方 PID，并把 TargetId 转为目标账号名。发送方 `chat_client` 调用 `do_send_private/3` 编码并发送 `3001`，然后继续处理自己的邮箱。
 
 2. 发送方 `role_server` 收到 `3001`，按 `TargetRoleName` 直接读取 `online_roles` ETS，不经过 `role_online_server` 的消息队列。
 
@@ -651,7 +648,7 @@ Shell 或其他进程直接使用 `ClientPid ! Message` 触发客户端行为。
 
 ### 8\.6 断开连接
 
-1. 主动停止客户端时，Shell 可以直接发送 `ClientPid ! stop`，也可以调用 `chat_client_manager:stop_client/1` 发送同一条普通消息。
+1. 当前不提供单个客户端的对外停止接口。客户端 VM 结束、Socket 关闭或客户端异常时，`chat_client` 进入断开流程。
 
 2. `chat_client` 在 `handle_info/2` 中收到 `stop` 后正常结束，并在终止过程中关闭自己持有的 Socket。发生 `{tcp_closed, Socket}` 或 `{tcp_error, Socket, Reason}` 时，客户端也会结束；客户端进程退出后不会由 `chat_client_sup` 自动重启。
 
@@ -686,17 +683,12 @@ scripts/start_client.sh -> chat_client_sup:start_link()
 ./scripts/start_client.sh
 ```
 
-服务端不会自动创建测试客户端。客户端 Shell 使用 `chat_client_manager:start_client/2` 创建一个或多个独立客户端，再通过普通消息触发客户端行为：
+客户端 Shell 使用 ClientId 创建和操作客户端：
 
 ```Erlang
-{ok, Client} = chat_client_manager:start_client("127.0.0.1", 5555).
-Client ! {login, <<"alice">>, <<"secret">>}.
-Client ! list_channels.
-Client ! {join_channel, 2}.
-Client ! {send_channel, 2, <<"hello">>}.
-Client ! {send_private, <<"bob">>, <<"hello">>}.
-Client ! {leave_channel, 2}.
-Client ! stop.
+{ok, 2} = client:start_client(1, 2).
+ok = client:send_channel(1, 1, <<"hello">>).
+ok = client:send_private(1, 2, <<"hello">>).
 ```
 
 消息发送表达式立即结束，服务端业务结果稍后由 `chat_client` 自己处理并打印。手动操作时，应先观察上一条操作的异步结果，再决定下一条命令。
@@ -707,7 +699,7 @@ Client ! stop.
 
 1. 服务端正常启动 `role_online_server`、`channel_manager`、`main` 和 9 个公共频道进程，并监听 TCP 端口。
 
-2. Shell 向客户端发送登录消息后立即返回；客户端稍后处理 `1002`。新 RoleName 第一次登录时自动创建账号并取得 RoleId，断开后使用已有账号登录时复用原 RoleId。
+2. `client:start_client/2` 创建客户端并自动发送登录消息；客户端稍后处理 `1002`。新账号第一次登录时取得 RoleId，断开后使用已有账号登录时复用原 RoleId。
 
 3. 密码错误时客户端异步记录、打印 `invalid_login` 并保持连接，之后可以再次接收登录消息；同一账号重复在线时记录、打印 `already_online`。
 
@@ -735,9 +727,9 @@ Client ! stop.
 
 - 不实现地图、移动、AOI、地图聊天和周围聊天。
 
-- 不实现自动批量创建客户端、自动压力测试、结果汇总、心跳和空闲超时。
+- 不实现自动压力测试、结果汇总、心跳和空闲超时。
 
-- 当前客户端只提供手动行为消息，不实现测试模式切换、随机消息循环和发送频率控制。
+- 当前只提供范围创建、频道发送和私聊三个客户端操作，不实现测试模式、随机消息循环和发送频率控制。
 
 - 客户端断开后不自动重连，必须重新创建客户端进程。
 

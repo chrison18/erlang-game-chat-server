@@ -4,6 +4,8 @@
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+-define(AUTO_SEND_INTERVAL_MS, 1000).
+
 start_link(Host, Port) ->
     gen_server:start_link(?MODULE, [Host, Port], []).
 
@@ -15,7 +17,8 @@ init([Host, Port]) ->
                    status => connected,
                    role_id => undefined,
                    role_name => undefined,
-                   channel_ids => #{}}};
+                   channel_ids => #{},
+                   auto_send_seq => 1}};
         {error, Reason} ->
             {stop, {connect_failed, Reason}}
     end.
@@ -38,6 +41,14 @@ handle_info({send_channel, ChannelId, Content}, State) ->
     {noreply, do_send_channel(ChannelId, Content, State)};
 handle_info({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
+handle_info(auto_send_channel,
+            #{status := online,
+              role_name := RoleName,
+              auto_send_seq := Sequence} = State) ->
+    Content = auto_message(RoleName, Sequence),
+    SentState = do_send_channel(1, Content, State),
+    schedule_auto_send(),
+    {noreply, SentState#{auto_send_seq := Sequence + 1}};
 handle_info(stop, State) ->
     {stop, normal, State};
 handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
@@ -167,6 +178,7 @@ handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
                      role_id := RoleId,
                      channel_ids := maps:from_list(
                          [{ChannelId, true} || ChannelId <- ChannelIds])},
+    schedule_auto_send(),
     report_result(login, Result, NewState);
 handle_response({login_result, {error, _Reason} = Result}, State) ->
     NewState = State#{status := connected,
@@ -205,6 +217,14 @@ handle_response({server_error, RequestProtoId, Reason}, State) ->
 report_result(Action, Result, State) ->
     print_result(Action, Result),
     State.
+
+schedule_auto_send() ->
+    _ = erlang:send_after(?AUTO_SEND_INTERVAL_MS, self(), auto_send_channel),
+    ok.
+
+auto_message(RoleName, Sequence) ->
+    <<RoleName/binary, " auto message ",
+      (integer_to_binary(Sequence))/binary>>.
 
 print_result(Action, Result) ->
     io:format("[~p] ~p~n", [Action, Result]).
