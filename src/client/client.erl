@@ -3,6 +3,7 @@
 
 -export([start_link/0,
          start_client/2,
+         start_observer/0,
          send_channel/3,
          send_private/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -10,6 +11,7 @@
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(DEFAULT_PORT, 5555).
 -define(DEFAULT_PASSWORD, <<"123456">>).
+-define(OBSERVER_ROLE_NAME, <<"observer_001">>).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -20,6 +22,9 @@ start_client(StartId, EndId)
     gen_server:call(?MODULE, {start_client, StartId, EndId}, infinity);
 start_client(_StartId, _EndId) ->
     {error, invalid_client_range}.
+
+start_observer() ->
+    gen_server:call(?MODULE, start_observer, infinity).
 
 send_channel(ClientId, ChannelId, Content)
   when is_integer(ClientId), ClientId > 0 ->
@@ -56,6 +61,31 @@ handle_call({start_client, StartId, EndId}, _From,
             end;
         ClientId ->
             {reply, {error, {client_already_started, ClientId}}, State}
+    end;
+handle_call(start_observer, _From,
+            #{host := Host,
+              port := Port,
+              clients := Clients,
+              monitors := Monitors} = State) ->
+    case find_client_pid(observer, Clients) of
+        {ok, _ObserverPid} ->
+            {reply, {error, observer_already_started}, State};
+        error ->
+            case chat_client_sup:start_client(
+                     observer, Host, Port, observer) of
+                {ok, ObserverPid} ->
+                    MonitorRef = erlang:monitor(process, ObserverPid),
+                    ObserverPid ! {login, ?OBSERVER_ROLE_NAME,
+                                    ?DEFAULT_PASSWORD},
+                    NewState = State#{
+                        clients := Clients#{
+                            observer => {ObserverPid, MonitorRef}},
+                        monitors := Monitors#{MonitorRef => observer}
+                    },
+                    {reply, ok, NewState};
+                {error, Reason} ->
+                    {reply, {error, {observer_start_failed, Reason}}, State}
+            end
     end;
 handle_call({send_channel, ClientId, ChannelId, Content}, _From,
             #{clients := Clients} = State) ->
@@ -104,7 +134,7 @@ start_clients(ClientId, EndId,
                 clients := Clients,
                 monitors := Monitors} = State,
               Count) ->
-    case chat_client_sup:start_client(ClientId, Host, Port) of
+    case chat_client_sup:start_client(ClientId, Host, Port, normal) of
         {ok, ClientPid} ->
             MonitorRef = erlang:monitor(process, ClientPid),
             ClientPid ! {login, role_name(ClientId), ?DEFAULT_PASSWORD},

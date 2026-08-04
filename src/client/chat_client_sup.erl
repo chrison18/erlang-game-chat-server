@@ -1,15 +1,15 @@
 -module(chat_client_sup).
 -behaviour(supervisor).
 
--export([start_link/0, start_client/3]).
+-export([start_link/0, start_client/4]).
 -export([init/1]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-start_client(ClientId, Host, Port) ->
+start_client(ClientId, Host, Port, Mode) ->
     ChildSpec = #{id => {chat_client, ClientId},
-                  start => {chat_client, start_link, [Host, Port]},
+                  start => {chat_client, start_link, [Host, Port, Mode]},
                   restart => temporary,
                   shutdown => 5000,
                   type => worker,

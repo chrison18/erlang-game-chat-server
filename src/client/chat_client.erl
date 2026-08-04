@@ -1,16 +1,17 @@
 -module(chat_client).
 -behaviour(gen_server).
 
--export([start_link/2]).
+-export([start_link/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(AUTO_SEND_INTERVAL_MS, 1000).
+-define(OBSERVER_REPORT_INTERVAL_MS, 1000).
 
-start_link(Host, Port) ->
-    gen_server:start_link(?MODULE, [Host, Port], []).
+start_link(Host, Port, Mode) ->
+    gen_server:start_link(?MODULE, [Host, Port, Mode], []).
 
-init([Host, Port]) ->
-    Options = [binary, {packet, 4}, {active, once}],
+init([Host, Port, Mode]) ->
+    Options = [binary, {packet, 4}, {active, true}],
     case gen_tcp:connect(Host, Port, Options) of
         {ok, Socket} ->
             {ok, #{socket => Socket,
@@ -18,7 +19,10 @@ init([Host, Port]) ->
                    role_id => undefined,
                    role_name => undefined,
                    channel_ids => #{},
-                   auto_send_seq => 1}};
+                   auto_send_seq => 1,
+                   mode => Mode,
+                   observer_received => 0,
+                   observer_invalid => 0}};
         {error, Reason} ->
             {stop, {connect_failed, Reason}}
     end.
@@ -42,23 +46,28 @@ handle_info({send_channel, ChannelId, Content}, State) ->
 handle_info({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
 handle_info(auto_send_channel,
-            #{status := online,
+            #{mode := normal,
+              status := online,
               role_name := RoleName,
               auto_send_seq := Sequence} = State) ->
     Content = auto_message(RoleName, Sequence),
     SentState = do_send_channel(1, Content, State),
     schedule_auto_send(),
     {noreply, SentState#{auto_send_seq := Sequence + 1}};
+handle_info(observer_report,
+            #{mode := observer,
+              role_name := RoleName,
+              observer_received := Received,
+              observer_invalid := Invalid} = State) ->
+    io:format("observer=~ts received=~p invalid=~p~n",
+              [RoleName, Received, Invalid]),
+    schedule_observer_report(),
+    {noreply, State#{observer_received := 0,
+                     observer_invalid := 0}};
 handle_info(stop, State) ->
     {stop, normal, State};
 handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
-    NewState = handle_server_packet(Packet, State),
-    case inet:setopts(Socket, [{active, once}]) of
-        ok ->
-            {noreply, NewState};
-        {error, Reason} ->
-            {stop, {socket_activation_failed, Reason}, NewState}
-    end;
+    {noreply, handle_server_packet(Packet, State)};
 handle_info({tcp_closed, Socket}, #{socket := Socket} = State) ->
     {stop, normal, State};
 handle_info({tcp_error, Socket, Reason}, #{socket := Socket} = State) ->
@@ -162,15 +171,13 @@ normalize_text(Text) ->
 handle_server_packet(Packet, State) ->
     case chat_client_protocol:decode_packet(Packet) of
         {ok, {channel_push, Message}} ->
-            print_channel_push(Message),
-            State;
-        {ok, {private_push, Message}} ->
-            print_private_push(Message),
+            handle_channel_push(Message, State);
+        {ok, {private_push, _Message}} ->
             State;
         {ok, Response} ->
             handle_response(Response, State);
         {error, Reason} ->
-            report_result(protocol, {error, Reason}, State)
+            handle_invalid_packet(Reason, State)
     end.
 
 handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
@@ -178,7 +185,7 @@ handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
                      role_id := RoleId,
                      channel_ids := maps:from_list(
                          [{ChannelId, true} || ChannelId <- ChannelIds])},
-    schedule_auto_send(),
+    schedule_mode(NewState),
     report_result(login, Result, NewState);
 handle_response({login_result, {error, _Reason} = Result}, State) ->
     NewState = State#{status := connected,
@@ -214,12 +221,40 @@ handle_response({private_send_result, Result}, State) ->
 handle_response({server_error, RequestProtoId, Reason}, State) ->
     report_result({server_error, RequestProtoId}, {error, Reason}, State).
 
-report_result(Action, Result, State) ->
+report_result(Action, Result, #{mode := observer} = State) ->
     print_result(Action, Result),
+    State;
+report_result(_Action, _Result, State) ->
     State.
+
+handle_channel_push(Message,
+                    #{mode := observer,
+                      observer_received := Received} = State) ->
+    print_channel_push(Message),
+    State#{observer_received := Received + 1};
+handle_channel_push(_Message, State) ->
+    State.
+
+handle_invalid_packet(Reason,
+                      #{mode := observer,
+                        observer_invalid := Invalid} = State) ->
+    print_result(protocol, {error, Reason}),
+    State#{observer_invalid := Invalid + 1};
+handle_invalid_packet(_Reason, State) ->
+    State.
+
+schedule_mode(#{mode := observer}) ->
+    schedule_observer_report();
+schedule_mode(#{mode := normal}) ->
+    schedule_auto_send().
 
 schedule_auto_send() ->
     _ = erlang:send_after(?AUTO_SEND_INTERVAL_MS, self(), auto_send_channel),
+    ok.
+
+schedule_observer_report() ->
+    _ = erlang:send_after(
+        ?OBSERVER_REPORT_INTERVAL_MS, self(), observer_report),
     ok.
 
 auto_message(RoleName, Sequence) ->
@@ -235,9 +270,3 @@ print_channel_push(#{channel_id := ChannelId,
                      content := Content}) ->
     io:format("[channel ~p] ~ts(~p): ~ts~n",
               [ChannelId, SenderRoleName, SenderRoleId, Content]).
-
-print_private_push(#{sender_role_id := SenderRoleId,
-                     sender_role_name := SenderRoleName,
-                     content := Content}) ->
-    io:format("[private] ~ts(~p): ~ts~n",
-              [SenderRoleName, SenderRoleId, Content]).

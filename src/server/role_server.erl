@@ -30,7 +30,7 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 handle_info({socket_ready, Socket}, #{socket := undefined} = State) ->
-    case inet:setopts(Socket, [{active, once}]) of
+    case inet:setopts(Socket, [{active, true}]) of
         ok ->
             {noreply, State#{socket := Socket}};
         {error, Reason} ->
@@ -39,12 +39,7 @@ handle_info({socket_ready, Socket}, #{socket := undefined} = State) ->
 handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
     case handle_packet(Packet, Socket) of
         ok ->
-            case inet:setopts(Socket, [{active, once}]) of
-                ok ->
-                    {noreply, State};
-                {error, Reason} ->
-                    {stop, {socket_activation_failed, Reason}, State}
-            end;
+            {noreply, State};
         {error, Reason} ->
             {stop, Reason, State}
     end;

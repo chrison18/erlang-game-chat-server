@@ -447,13 +447,13 @@ gen_server:cast(TargetRolePid, {
 
 ### 7\.1 外层格式和字段
 
-服务端监听和接收 Socket 时使用 `[binary, {packet, 4}, {active, false}]`。完成 Socket 控制权转交后，`role_server` 改为 `{active, once}`；客户端连接 Socket 从创建时就使用 `{active, once}`。网络格式为：
+服务端监听和接收 Socket 时使用 `[binary, {packet, 4}, {active, false}]`。完成 Socket 控制权转交后，`role_server` 改为 `{active, true}`；客户端连接 Socket 从创建时就使用 `{active, true}`。网络格式为：
 
 ```Erlang
 <<PacketLength:32, ProtoId:16, Data/binary>>
 ```
 
-`PacketLength` 由 `gen_tcp` 自动添加和去除，业务代码处理 `<<ProtoId:16, Data/binary>>`。每处理一条 `{tcp, Socket, Packet}` 后重新设置 `{active, once}`。
+`PacketLength` 由 `gen_tcp` 自动添加和去除，业务代码处理 `<<ProtoId:16, Data/binary>>`。Socket 持续把收到的完整业务包作为 `{tcp, Socket, Packet}` 消息投递给控制进程，不需要在处理每个包后重新激活。
 
 |字段|位数|
 |---|---|
@@ -584,7 +584,7 @@ gen_server:cast(TargetRolePid, {
 
 3. `chat_listener` 使用 `gen_tcp:controlling_process/2` 把 Socket 控制权转交给该 `role_server`。
 
-4. 转交成功后发送 `{socket_ready, Socket}`；`role_server` 保存 Socket，并设置 `{active, once}` 接收数据。
+4. 转交成功后发送 `{socket_ready, Socket}`；`role_server` 保存 Socket，并设置 `{active, true}` 持续接收数据。
 
 5. 任一步骤失败都关闭新 Socket；成功后 `chat_listener` 继续等待下一个连接。
 
@@ -610,7 +610,7 @@ gen_server:cast(TargetRolePid, {
 
 9. 登录失败时，服务端通过 `1002` 返回对应结果码并保留 TCP 连接。客户端把状态恢复为 `connected`，清理未成功的角色数据并打印错误，之后可以再次接收登录消息。
 
-登录结果始终由 `chat_client` 自己处理，不通过 `gen_server:reply/2` 返回给发送登录消息的进程。每处理完一条 TCP 报文，客户端都会重新设置 `{active, once}`，继续等待下一条网络消息。
+登录结果始终由 `chat_client` 自己处理，不通过 `gen_server:reply/2` 返回给发送登录消息的进程。客户端 Socket 使用 `{active, true}`，持续接收 TCP 报文，不需要在每条报文处理完成后重新激活。
 
     
 

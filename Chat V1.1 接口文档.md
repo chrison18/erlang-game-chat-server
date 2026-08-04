@@ -101,7 +101,7 @@ ok = client:send_private(1, 2, <<"hello client 2">>).
 
 ## 6. TCP 协议索引
 
-Socket 使用 `binary`、`{packet, 4}` 和 `{active, once}`。`PacketLength` 由 `gen_tcp` 自动处理，业务层报文从 16 位 `ProtoId` 开始。
+Socket 使用 `binary`、`{packet, 4}` 和 `{active, true}`。`PacketLength` 由 `gen_tcp` 自动处理，业务层报文从 16 位 `ProtoId` 开始。
 
 | 请求 | 结果或推送 | 功能 |
 |---|---|---|
