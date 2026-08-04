@@ -21,6 +21,8 @@ handle_cast({push_channel, ChannelId, SenderRoleId, SenderRoleName, Content},
     Packet = chat_server_protocol:encode_channel_push(
         ChannelId, SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
+handle_cast({push_channel_packet, Packet}, #{socket := Socket} = State) ->
+    handle_push_send(Socket, Packet, State);
 handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
             #{socket := Socket} = State) ->
     Packet = chat_server_protocol:encode_private_push(
@@ -228,13 +230,13 @@ send_channel_message(ChannelId, RoleId, RoleName, Content) ->
     case ets:lookup(channel_info, ChannelId) of
         [] ->
             {error, invalid_channel};
-        [#channel_info{channel_pid = ChannelPid}] ->
+        [#channel_info{} = ChannelInfo] ->
             case maps:is_key(ChannelId, get(channel_ids)) of
                 false ->
                     {error, not_joined};
                 true ->
                     channel_server:send_channel(
-                        ChannelPid, RoleId, RoleName, Content)
+                        ChannelInfo, RoleId, RoleName, Content)
             end
     end.
 

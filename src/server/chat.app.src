@@ -16,6 +16,7 @@
              channel_manager,
              channel_sup,
              channel_server,
+             world_broadcast_worker,
              role_sup,
              role_server,
              chat_listener,

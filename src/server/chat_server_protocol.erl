@@ -106,7 +106,10 @@ encode_channel_send_result({error, invalid_channel, ChannelId}) ->
       ?CHANNEL_SEND_RESULT_INVALID_CHANNEL:8, ChannelId:32>>;
 encode_channel_send_result({error, not_joined, ChannelId}) ->
     <<?PROTO_CHANNEL_SEND_RESULT:16,
-      ?CHANNEL_SEND_RESULT_NOT_JOINED:8, ChannelId:32>>.
+      ?CHANNEL_SEND_RESULT_NOT_JOINED:8, ChannelId:32>>;
+encode_channel_send_result({error, broadcast_failed, ChannelId}) ->
+    <<?PROTO_CHANNEL_SEND_RESULT:16,
+      ?CHANNEL_SEND_RESULT_BROADCAST_FAILED:8, ChannelId:32>>.
 
 encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
     SenderNameLength = byte_size(SenderRoleName),

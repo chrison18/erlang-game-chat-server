@@ -4,7 +4,7 @@
 -export([start_link/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--define(AUTO_SEND_INTERVAL_MS, 1000).
+-define(AUTO_SEND_INTERVAL_MS, 3000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
 
 start_link(Host, Port, Mode) ->

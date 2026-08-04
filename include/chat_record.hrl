@@ -25,13 +25,24 @@
     channel_id,
     channel_type,
     channel_name,
-    members = #{}
+    members = #{},
+    member_monitors = #{}
 }).
 
 -record(channel_member, {
     role_id,
     role_pid,
     monitor_ref
+}).
+
+-record(world_channel_member, {
+    role_id,
+    role_pid
+}).
+
+-record(world_broadcast_worker, {
+    worker_index,
+    worker_pid
 }).
 
 -endif.

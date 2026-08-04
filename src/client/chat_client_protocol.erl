@@ -168,6 +168,8 @@ decode_channel_send_result(?CHANNEL_SEND_RESULT_INVALID_CHANNEL, ChannelId) ->
     {error, invalid_channel, ChannelId};
 decode_channel_send_result(?CHANNEL_SEND_RESULT_NOT_JOINED, ChannelId) ->
     {error, not_joined, ChannelId};
+decode_channel_send_result(?CHANNEL_SEND_RESULT_BROADCAST_FAILED, ChannelId) ->
+    {error, broadcast_failed, ChannelId};
 decode_channel_send_result(ResultCode, ChannelId) ->
     {error, {unknown_result, ResultCode}, ChannelId}.
 
