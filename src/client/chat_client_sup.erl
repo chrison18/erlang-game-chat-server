@@ -1,15 +1,16 @@
 -module(chat_client_sup).
 -behaviour(supervisor).
 
--export([start_link/0, start_client/4]).
+-export([start_link/0, start_client/6]).
 -export([init/1]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-start_client(ClientId, Host, Port, Mode) ->
+start_client(ClientId, Host, Port, RoleName, Password, Mode) ->
     ChildSpec = #{id => {chat_client, ClientId},
-                  start => {chat_client, start_link, [Host, Port, Mode]},
+                  start => {chat_client, start_link,
+                            [ClientId, Host, Port, RoleName, Password, Mode]},
                   restart => temporary,
                   shutdown => 5000,
                   type => worker,
@@ -17,13 +18,7 @@ start_client(ClientId, Host, Port, Mode) ->
     supervisor:start_child(?MODULE, ChildSpec).
 
 init([]) ->
-    SupFlags = #{strategy => rest_for_one,
+    SupFlags = #{strategy => one_for_one,
                  intensity => 5,
                  period => 10},
-    ClientManager = #{id => client,
-                      start => {client, start_link, []},
-                      restart => permanent,
-                      shutdown => 5000,
-                      type => worker,
-                      modules => [client]},
-    {ok, {SupFlags, [ClientManager]}}.
+    {ok, {SupFlags, []}}.

@@ -5,6 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EBIN_DIR="$PROJECT_DIR/ebin"
 
 mkdir -p "$EBIN_DIR"
+rm -f "$EBIN_DIR"/*.beam
 
 shopt -s nullglob
 SOURCE_FILES=(

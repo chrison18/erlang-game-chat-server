@@ -23,6 +23,6 @@
              chat_metrics,
              chat_server_protocol,
              chat_client_sup,
-             client,
+             chat_load_test,
              chat_client,
              chat_client_protocol]}]}.

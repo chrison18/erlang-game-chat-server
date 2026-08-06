@@ -1,29 +1,34 @@
 -module(chat_client).
 -behaviour(gen_server).
 
--export([start_link/3]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([start_link/6]).
+-export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
+         handle_info/2, terminate/2]).
 
 -define(AUTO_SEND_INTERVAL_MS, 3000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
 
-start_link(Host, Port, Mode) ->
-    gen_server:start_link(?MODULE, [Host, Port, Mode], []).
+start_link(ClientId, Host, Port, RoleName, Password, Mode) ->
+    gen_server:start_link(
+        ?MODULE, [ClientId, Host, Port, RoleName, Password, Mode], []).
 
-init([Host, Port, Mode]) ->
+init([ClientId, Host, Port, RoleName, Password, Mode]) ->
     Options = [binary, {packet, 4}, {active, true}],
     case gen_tcp:connect(Host, Port, Options) of
         {ok, Socket} ->
-            {ok, #{socket => Socket,
+            {ok, #{client_id => ClientId,
+                   socket => Socket,
                    status => connected,
                    role_id => undefined,
-                   role_name => undefined,
+                   role_name => RoleName,
+                   password => Password,
                    channel_ids => #{},
-                   auto_send_seq => 1,
-                   auto_send => stopped,
+                   action_seq => 1,
+                   action_state => idle,
                    mode => Mode,
                    observer_received => 0,
-                   observer_invalid => 0}};
+                   observer_invalid => 0},
+             {continue, login}};
         {error, Reason} ->
             {stop, {connect_failed, Reason}}
     end.
@@ -31,44 +36,36 @@ init([Host, Port, Mode]) ->
 handle_call(Request, _From, State) ->
     {stop, {unsupported_call, Request}, State}.
 
-handle_cast(Request, State) ->
-    {stop, {unsupported_cast, Request}, State}.
-
-handle_info({login, RoleName, Password}, State) ->
-    {noreply, do_login(RoleName, Password, State)};
-handle_info(list_channels, State) ->
+handle_cast(list_channels, State) ->
     {noreply, do_list_channels(State)};
-handle_info({join_channel, ChannelId}, State) ->
+handle_cast({join_channel, ChannelId}, State) ->
     {noreply, do_join_channel(ChannelId, State)};
-handle_info({leave_channel, ChannelId}, State) ->
+handle_cast({leave_channel, ChannelId}, State) ->
     {noreply, do_leave_channel(ChannelId, State)};
-handle_info({send_channel, ChannelId, Content}, State) ->
+handle_cast({send_channel, ChannelId, Content}, State) ->
     {noreply, do_send_channel(ChannelId, Content, State)};
-handle_info({send_private, TargetRoleName, Content}, State) ->
+handle_cast({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
-handle_info({start_send_loop, ClientId},
-            #{mode := normal,
-              status := online,
-              auto_send := stopped} = State) ->
-    schedule_auto_send(initial_send_delay(ClientId)),
-    {noreply, State#{auto_send := running}};
-handle_info({start_send_loop, ClientId},
-            #{mode := normal,
-              auto_send := stopped} = State) ->
-    InitialDelay = initial_send_delay(ClientId),
-    {noreply, State#{auto_send := {pending, InitialDelay}}};
-handle_info({start_send_loop, _ClientId}, State) ->
-    {noreply, State};
+handle_cast(stop, State) ->
+    {stop, normal, State};
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_continue(login,
+                #{role_name := RoleName, password := Password} = State) ->
+    LoginState = maps:remove(password, State),
+    {noreply, do_login(RoleName, Password, LoginState)}.
+
 handle_info(auto_send_channel,
             #{mode := normal,
               status := online,
-              auto_send := running,
+              action_state := running,
               role_name := RoleName,
-              auto_send_seq := Sequence} = State) ->
+              action_seq := Sequence} = State) ->
     Content = auto_message(RoleName, Sequence),
     SentState = do_send_channel(1, Content, State),
-    schedule_auto_send(),
-    {noreply, SentState#{auto_send_seq := Sequence + 1}};
+    schedule_next_action(),
+    {noreply, SentState#{action_seq := Sequence + 1}};
 handle_info(observer_report,
             #{mode := observer,
               role_name := RoleName,
@@ -263,17 +260,15 @@ start_mode_after_login(#{mode := observer} = State) ->
     State;
 start_mode_after_login(
         #{mode := normal,
-          auto_send := {pending, InitialDelay}} = State) ->
-    schedule_auto_send(InitialDelay),
-    State#{auto_send := running};
+          action_state := idle} = State) ->
+    schedule_next_action(),
+    State#{action_state := running};
 start_mode_after_login(State) ->
     State.
 
-schedule_auto_send() ->
-    schedule_auto_send(?AUTO_SEND_INTERVAL_MS).
-
-schedule_auto_send(Delay) ->
-    _ = erlang:send_after(Delay, self(), auto_send_channel),
+schedule_next_action() ->
+    _ = erlang:send_after(
+        ?AUTO_SEND_INTERVAL_MS, self(), auto_send_channel),
     ok.
 
 schedule_observer_report() ->
@@ -284,9 +279,6 @@ schedule_observer_report() ->
 auto_message(RoleName, Sequence) ->
     <<RoleName/binary, " auto message ",
       (integer_to_binary(Sequence))/binary>>.
-
-initial_send_delay(ClientId) ->
-    (ClientId - 1) rem ?AUTO_SEND_INTERVAL_MS.
 
 print_result(Action, Result) ->
     io:format("[~p] ~p~n", [Action, Result]).

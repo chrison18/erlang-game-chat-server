@@ -10,7 +10,7 @@ V1.1 提供以下功能：
 - 账号首次登录自动创建、密码校验和重复在线检查
 - 查询、加入和退出固定频道
 - 频道聊天和私聊
-- 批量启动静默客户端、独立观察者和自动发送循环
+- 批量启动自动行动客户端和独立观察者
 - 角色下线后的在线记录与频道成员清理
 
 ## 2. 编译与启动
@@ -39,48 +39,39 @@ V1.1 提供以下功能：
 
 | 接口 | 返回值 | 说明 |
 |---|---|---|
-| `client:start_client(StartId, EndId)` | `{ok, Count} \| {error, Reason}` | 串行创建首尾 ID 范围内的普通客户端并触发异步登录 |
-| `client:start_observer()` | `ok \| {error, Reason}` | 独立创建账号为 `observer_001` 的观察者并触发异步登录 |
-| `client:start_send_loop()` | `{ok, Count}` | 让当前全部普通客户端开始自动发送循环 |
-| `client:start_send_loop(StartId, EndId)` | `{ok, Count} \| {error, Reason}` | 让指定 ClientId 范围开始自动发送循环 |
-| `client:send_channel(ClientId, ChannelId, Content)` | `ok \| {error, Reason}` | 指定客户端发送频道消息 |
-| `client:send_private(SenderId, TargetId, Content)` | `ok \| {error, Reason}` | 指定客户端向目标客户端私聊 |
+| `chat_load_test:start(StartId, EndId)` | `{ok, Count} \| {error, Reason}` | 串行创建首尾 ID 范围内的普通客户端；每个客户端自行登录并进入固定间隔动作循环 |
+| `chat_load_test:start_observer()` | `ok \| {error, Reason}` | 独立创建账号为 `observer_001` 的观察者并自动登录 |
+| `chat_load_test:send_channel(ClientId, ChannelId, Content)` | `ok \| {error, Reason}` | 指定客户端发送频道消息 |
+| `chat_load_test:send_private(SenderId, TargetId, Content)` | `ok \| {error, Reason}` | 指定客户端向目标客户端私聊 |
 
 示例：
 
 ```erlang
-ok = client:start_observer().
-{ok, 100} = client:start_client(1, 100).
-{ok, 10} = client:start_send_loop(1, 10).
-ok = client:send_channel(1, 1, <<"hello main">>).
-ok = client:send_private(1, 2, <<"hello client 2">>).
+ok = chat_load_test:start_observer().
+{ok, 100} = chat_load_test:start(1, 100).
+ok = chat_load_test:send_channel(1, 1, <<"hello main">>).
+ok = chat_load_test:send_private(1, 2, <<"hello client 2">>).
 ```
 
-`start_client(1, 100)` 包含起止 ID，共创建 100 个客户端。客户端使用
-`client_1` 到 `client_100` 作为账号名，统一使用 `123456` 作为密码。登录成功后只
-保持在线，不会自动发送消息。
+`start(1, 100)` 包含起止 ID，共创建 100 个客户端。客户端使用 `client_1` 到
+`client_100` 作为账号名。每个客户端连接后自行登录，登录成功后使用 `send_after`
+安排第一条 `main` 消息；每次发送完成后再安排下一次动作，固定间隔为 3000ms。
 
-`start_client/2` 完成的是客户端进程的串行创建，返回 `{ok, Count}` 时不代表所有
-客户端已经登录成功。`observer_001` 不自动发送消息，应在压测客户端之外独立启动。
-
-`start_send_loop/0` 通知当前存活的全部数字客户端开始自动发送，并返回通知数量。
-`start_send_loop/2` 只通知包含首尾 ID 的指定范围，适合逐级增加发送者。返回的 Count
-是本次找到并通知的存活客户端数，不是新启动循环的数量。客户端首次发送时间按
-ClientId 均匀分散到 `0~2999ms`，之后通过 `send_after`
-每隔 3000ms 向 `main` 发送一次。重复调用不会为同一客户端增加重复定时器，观察者
-不参与该循环。
+`start/2` 返回 `{ok, Count}` 只表示这些客户端进程已经创建，不表示全部登录响应都已
+返回。所有普通客户端使用相同的 3000ms 间隔，不根据 ClientId 计算首次 delay 或
+偏移量；实际发送时刻仍受连接、登录响应和 BEAM 调度影响。`observer_001` 不自动
+发送消息，应独立启动。
 
 ## 4. 内部执行方式
 
-`client` 保存 ClientId 与客户端 PID 的对应关系。接口找到对应 PID 后，只向
-`chat_client` 发送普通 Erlang 消息，登录、发包、收包和状态更新仍由客户端自身完成。
+`chat_load_test` 是普通函数模块，不是 GenServer，也不保存 ClientId 与 PID 的映射。
+它通过 `chat_client_sup` 启动客户端；手工操作时读取 supervisor 当前子进程并直接向
+对应 `chat_client` cast。登录、发包、收包、状态和连续动作都由客户端自身管理。
 
-| 对外接口 | 发给 `chat_client` 的内部消息 |
+| 对外接口 | 执行方式或发给 `chat_client` 的消息 |
 |---|---|
-| `start_client/2` | `{login, RoleName, Password}` |
-| `start_observer/0` | `{login, <<"observer_001">>, Password}` |
-| `start_send_loop/0` | `{start_send_loop, ClientId}` |
-| `start_send_loop/2` | `{start_send_loop, ClientId}` |
+| `start/2` | supervisor 启动参数包含 ClientId 和登录身份；客户端通过 `handle_continue` 自行登录 |
+| `start_observer/0` | supervisor 启动观察者；观察者通过 `handle_continue` 自行登录 |
 | `send_channel/3` | `{send_channel, ChannelId, Content}` |
 | `send_private/3` | `{send_private, TargetRoleName, Content}` |
 
@@ -168,19 +159,17 @@ Socket 使用 `binary`、`{packet, 4}` 和 `{active, true}`。`PacketLength` 由
 在客户端 Shell 中创建两个客户端并操作：
 
 ```erlang
-ok = client:start_observer().
-{ok, 2} = client:start_client(1, 2).
-{ok, 2} = client:start_send_loop(1, 2).
-ok = client:send_channel(1, 1, <<"hello main">>).
-ok = client:send_private(1, 2, <<"hello client 2">>).
+ok = chat_load_test:start_observer().
+{ok, 2} = chat_load_test:start(1, 2).
+ok = chat_load_test:send_channel(1, 1, <<"hello main">>).
+ok = chat_load_test:send_private(1, 2, <<"hello client 2">>).
 ```
 
 验收时确认：
 
 1. 观察者和 ClientId 1、2 对应的客户端均保持在线。
 2. 登录后必定加入 `main`，并随机加入 1 到 3 个公共频道。
-3. 调用 `start_send_loop/2` 前普通客户端不自动发消息，调用后观察者持续打印两个
-   普通客户端发出的 `main` 频道消息。
+3. 普通客户端登录成功后无需其他命令，观察者会持续收到它们发出的 `main` 消息。
 4. 观察者汇总中的 `invalid` 保持为 `0`。
 
 ## 9. V1.1 边界
@@ -190,6 +179,7 @@ ok = client:send_private(1, 2, <<"hello client 2">>).
 - 不保存聊天记录，不支持离线私聊。
 - 客户端断开后不自动重连。
 - 不包含心跳、空闲超时、自动重连和发送循环停止接口。
+- 普通客户端固定每 3000ms 发送一次，不提供运行时频率调整接口。
 - 观察者逐条打印频道消息，终端 I/O 本身可能在高负载下形成瓶颈；汇总仅反映观察者
   已处理的数据，不是服务端完整性证明。
 - 当前没有业务层流量控制或邮箱积压保护。
