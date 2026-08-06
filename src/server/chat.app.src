@@ -20,6 +20,7 @@
              role_sup,
              role_server,
              chat_listener,
+             chat_metrics,
              chat_server_protocol,
              chat_client_sup,
              client,

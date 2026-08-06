@@ -30,29 +30,43 @@ V1\.1 只完成三个基础功能：
 实线表示 Supervisor 的启动和监督关系，虚线表示业务调用或数据访问关系。
 
 ```mermaid
-flowchart TD
-    app[chat_app] --> sup[chat_sup]
-    sup --> online[role_online_server]
-    sup --> manager[channel_manager]
-    sup --> channelSup[channel_sup]
-    sup --> roleSup[role_sup]
-    sup --> listener[chat_listener]
+flowchart TB
+    subgraph Server[服务端 chat Application]
+        App[chat_app] --> Sup[chat_sup]
+        Sup --> Online[role_online_server]
+        Sup --> Manager[channel_manager]
+        Sup --> ChannelSup[channel_sup]
+        Sup --> RoleSup[role_sup]
+        Sup --> Listener[chat_listener]
 
-    channelSup --> main[channel_server main]
-    channelSup --> workers[8 个 world_broadcast_worker]
-    channelSup --> public[9 个 public channel_server]
-    roleSup --> roles[动态 role_server]
+        ChannelSup --> Main[channel_server main]
+        ChannelSup --> Workers[8 个 world_broadcast_worker]
+        ChannelSup --> Public[9 个 public channel_server]
+        RoleSup --> Roles[多个 role_server]
 
-    listener -. 创建连接进程并转交 Socket .-> roles
-    online -. 读写 role_accounts / online_roles .-> onlineEts[(账号与在线 ETS)]
-    manager -. 读写频道、世界成员和 Worker 注册 .-> channelEts[(频道 ETS)]
-    main -. 同步 main 成员 .-> manager
-    roles -. main 广播 .-> workers
-    roles -. 读取频道和 Worker 注册 .-> channelEts
-    workers -. 读取世界成员 .-> channelEts
-    workers -. 投递预编码 Packet .-> roles
-    roles -. public 广播 .-> public
-    roles -. 私聊查询 .-> onlineEts
+        Online -.拥有.-> RoleETS[(role_accounts 和 online_roles ETS)]
+        Manager -.拥有.-> ChannelETS[(channel_info<br/>world_channel_members<br/>world_broadcast_workers)]
+        Main -.保存.-> MainMembers[main 成员]
+        Public -.保存.-> PublicMembers[public 成员]
+        Roles -.保存.-> RoleState[Socket 和玩家进程字典]
+
+        Listener -.接收连接.-> RoleSup
+        Roles -.main 消息.-> Workers
+        Roles -.public 消息.-> Public
+        Roles -.私聊查询.-> RoleETS
+    end
+
+    subgraph Client[客户端 Shell]
+        ClientSup[chat_client_sup]
+        ClientManager[client 接口和 ClientId 管理]
+        ClientProcesses[普通客户端和 observer_001]
+
+        ClientSup --> ClientManager
+        ClientSup --> ClientProcesses
+        ClientManager -.管理.-> ClientProcesses
+    end
+
+    ClientProcesses <-->|一对一 TCP 长连接| Roles
 ```
 
 核心进程职责：
@@ -71,40 +85,127 @@ flowchart TD
 
 
 
-### **2\.2 主要消息流程图**
+### **2\.2 登录流程图**
 
-登录过程中，role\_online\_server 只处理账号和在线状态。频道加入由玩家 role\_server 直接调用对应的 channel\_server。
+`role_online_server` 只处理账号和在线状态。初始频道由 `role_server` 选择，并逐个调用对应的 `channel_server` 加入。
 
 ```mermaid
 sequenceDiagram
-    participant C as 发送方 chat_client
-    participant R as 发送方 role_server
-    participant M as public channel_server
-    participant W as world_broadcast_worker
-    participant E as world_channel_members ETS
-    participant T as 成员 role_server
-    participant TC as 成员 chat_client
+    participant Client as chat_client
+    participant Role as role_server
+    participant Online as role_online_server
+    participant ChannelInfo as channel_info ETS
+    participant Channel as channel_server
 
-    C->>R: 2007 频道消息
-    R->>R: 检查本地 channel_ids
-    alt ChannelId = 1
-        R->>W: call broadcast
-        W->>E: 检查发送者并遍历成员
-        W->>W: 2009 Packet 只编码一次
-        loop 每个世界频道成员
-            W-->>T: cast push_channel_packet
-        end
-        W-->>R: ok / not_joined / broadcast_failed
-    else ChannelId = 2..10
-        R->>M: call send_channel
-        M->>M: 检查成员 Map
-        loop 每个公共频道成员
-            M-->>T: cast push_channel
-        end
-        M-->>R: ok / not_joined
+    Client->>Role: TCP 1001 RoleName 和 Password
+    Role->>Online: call 登录
+
+    activate Online
+    Online->>Online: 检查账号、密码和在线状态
+    opt 新账号
+        Online->>Online: 创建账号并分配 RoleId
     end
-    R-->>C: 2008 发送结果
-    T-->>TC: 2009 频道推送
+    opt 验证成功
+        Online->>Online: 写入 online_roles 并监控 RolePid
+    end
+    Online-->>Role: 登录结果
+    deactivate Online
+
+    alt 登录成功
+        Role->>Role: 选择 main 和随机 1 到 3 个公共频道
+
+        loop 加入每个选中的频道
+            Role->>ChannelInfo: 按 ChannelId 查询 ChannelPid
+            ChannelInfo-->>Role: ChannelPid
+            Role->>Channel: call 加入频道
+            Channel->>Channel: 保存成员和 MonitorRef 索引
+            opt ChannelId = 1
+                Channel->>Channel: 同步 world_channel_members ETS
+            end
+            Channel-->>Role: 加入结果
+        end
+
+        Role->>Role: 保存 RoleId、RoleName 和 ChannelIds
+        Role-->>Client: TCP 1002 登录成功
+        Client->>Client: 保存在线状态和角色资料
+
+        alt normal 模式
+            Client->>Client: 安排 3000ms 后自动发送
+        else observer 模式
+            Client->>Client: 安排观察者周期报告
+        end
+    else 登录失败
+        Role-->>Client: TCP 1002 登录失败
+        Client->>Client: 恢复 connected 状态
+    end
+```
+
+
+
+### **2\.3 频道消息流程图**
+
+频道消息根据 ChannelId 分为 `main` 世界广播和公共频道广播，两条路径都由发送方 `role_server` 发起。
+
+```mermaid
+sequenceDiagram
+    participant Client as 发送方 chat_client
+    participant Role as 发送方 role_server
+    participant ChannelInfo as channel_info ETS
+    participant Worker as world_broadcast_worker
+    participant Channel as public channel_server
+    participant MemberRole as 成员 role_server
+    participant MemberClient as 成员 chat_client
+
+    Client->>Role: TCP 2007 ChannelId 和 Content
+    Role->>ChannelInfo: 查询 ChannelInfo
+
+    alt 频道不存在
+        Role-->>Client: TCP 2008 invalid_channel
+    else 频道存在
+        Role->>Role: 根据进程字典检查 ChannelId
+
+        alt 本地未加入频道
+            Role-->>Client: TCP 2008 not_joined
+        else 本地检查通过
+            alt ChannelId = 1
+                Role->>Role: 按 SenderRoleId 选择 Worker
+                Role->>Worker: call 世界广播
+                activate Worker
+                Worker->>Worker: 检查 world_channel_members
+
+                alt 世界频道检查通过
+                    Worker->>Worker: 2009 Packet 编码一次并遍历成员
+                    loop 每个世界频道成员
+                        Worker-->>MemberRole: cast push_channel_packet
+                        MemberRole-->>MemberClient: TCP 2009 频道推送
+                    end
+                    Worker-->>Role: success
+                else 世界频道检查失败
+                    Worker-->>Role: not_joined
+                end
+                deactivate Worker
+                Note over Role,Worker: Worker 不存在或 call 退出时返回 broadcast_failed
+            else ChannelId = 2..10
+                Role->>Channel: call 发送公共频道消息
+                activate Channel
+                Channel->>Channel: 检查发送者是否属于本频道
+
+                alt 公共频道检查通过
+                    loop 每个公共频道成员
+                        Channel-->>MemberRole: cast push_channel
+                        MemberRole-->>MemberClient: TCP 2009 频道推送
+                    end
+                    Channel-->>Role: success
+                else 公共频道检查失败
+                    Channel-->>Role: not_joined
+                end
+                deactivate Channel
+            end
+
+            Role-->>Client: TCP 2008 发送结果
+        end
+    end
+
 ```
 
 世界频道中，发送方 RoleId 通过 `phash2` 固定选择一个 Worker。Worker 完成对当前世界频道成员的邮箱投递后才返回，但成功只表示 cast 已进入各个 `role_server` 邮箱，不表示客户端 Socket 已经收到消息。
@@ -113,7 +214,38 @@ sequenceDiagram
 
 
 
-私聊不会经过 role\_online\_server 的消息邮箱。发送方 role\_server 直接读取 online\_roles ETS，再把私聊消息发送给目标 role\_server。
+### **2\.4 私聊流程图**
+
+私聊不经过 `role_online_server` 邮箱。发送方 `role_server` 直接读取 `online_roles` ETS，再异步投递给目标 `role_server`。
+
+```mermaid
+sequenceDiagram
+    participant SC as 发送方 chat_client
+    participant SR as 发送方 role_server
+    participant OnlineRoles as online_roles ETS
+    participant TR as 目标 role_server
+    participant TC as 目标 chat_client
+
+    SC->>SR: TCP 3001 TargetRoleName 和 Content
+    SR->>OnlineRoles: 查询 TargetRoleName
+
+    alt 目标在线
+        OnlineRoles-->>SR: TargetRolePid
+        SR-->>TR: cast push_private
+        SR-->>SC: TCP 3002 success
+
+        activate TR
+        TR->>TR: 编码 TCP 3003 私聊推送
+        TR-->>TC: TCP 3003 私聊推送
+        deactivate TR
+        TC->>TC: 解码后不打印
+    else 目标不在线
+        OnlineRoles-->>SR: not_found
+        SR-->>SC: TCP 3002 target_offline
+    end
+```
+
+`3002 success` 只表示发送时在 ETS 中找到了目标 RolePid，并已发出 cast，不保证目标客户端已经收到 `3003`。发送方结果和目标推送由两个 `role_server` 分别处理，到达两个客户端的先后顺序不作保证。
 
 
 

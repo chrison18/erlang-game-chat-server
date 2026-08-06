@@ -4,6 +4,8 @@
 -export([start_link/0,
          start_client/2,
          start_observer/0,
+         start_send_loop/0,
+         start_send_loop/2,
          send_channel/3,
          send_private/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
@@ -25,6 +27,17 @@ start_client(_StartId, _EndId) ->
 
 start_observer() ->
     gen_server:call(?MODULE, start_observer, infinity).
+
+start_send_loop() ->
+    gen_server:call(?MODULE, start_send_loop, infinity).
+
+start_send_loop(StartId, EndId)
+  when is_integer(StartId), StartId > 0,
+       is_integer(EndId), EndId >= StartId ->
+    gen_server:call(
+        ?MODULE, {start_send_loop, StartId, EndId}, infinity);
+start_send_loop(_StartId, _EndId) ->
+    {error, invalid_client_range}.
 
 send_channel(ClientId, ChannelId, Content)
   when is_integer(ClientId), ClientId > 0 ->
@@ -87,6 +100,14 @@ handle_call(start_observer, _From,
                     {reply, {error, {observer_start_failed, Reason}}, State}
             end
     end;
+handle_call(start_send_loop, _From,
+            #{clients := Clients} = State) ->
+    Count = notify_send_loop_clients(Clients),
+    {reply, {ok, Count}, State};
+handle_call({start_send_loop, StartId, EndId}, _From,
+            #{clients := Clients} = State) ->
+    Count = notify_send_loop_clients(StartId, EndId, Clients, 0),
+    {reply, {ok, Count}, State};
 handle_call({send_channel, ClientId, ChannelId, Content}, _From,
             #{clients := Clients} = State) ->
     case find_client_pid(ClientId, Clients) of
@@ -166,6 +187,34 @@ find_client_pid(ClientId, Clients) ->
         error ->
             error
     end.
+
+notify_send_loop_clients(Clients) ->
+    maps:fold(fun notify_send_loop_client/3, 0, Clients).
+
+notify_send_loop_clients(ClientId, EndId, _Clients, Count)
+  when ClientId > EndId ->
+    Count;
+notify_send_loop_clients(ClientId, EndId, Clients, Count) ->
+    NewCount = case find_client_pid(ClientId, Clients) of
+        {ok, ClientPid} ->
+            ClientPid ! {start_send_loop, ClientId},
+            Count + 1;
+        error ->
+            Count
+    end,
+    notify_send_loop_clients(ClientId + 1, EndId, Clients, NewCount).
+
+notify_send_loop_client(ClientId, {ClientPid, _MonitorRef}, Count)
+  when is_integer(ClientId) ->
+    case is_process_alive(ClientPid) of
+        true ->
+            ClientPid ! {start_send_loop, ClientId},
+            Count + 1;
+        false ->
+            Count
+    end;
+notify_send_loop_client(_ClientId, _Client, Count) ->
+    Count.
 
 role_name(ClientId) ->
     <<"client_", (integer_to_binary(ClientId))/binary>>.

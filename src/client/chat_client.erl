@@ -20,6 +20,7 @@ init([Host, Port, Mode]) ->
                    role_name => undefined,
                    channel_ids => #{},
                    auto_send_seq => 1,
+                   auto_send => stopped,
                    mode => Mode,
                    observer_received => 0,
                    observer_invalid => 0}};
@@ -45,9 +46,23 @@ handle_info({send_channel, ChannelId, Content}, State) ->
     {noreply, do_send_channel(ChannelId, Content, State)};
 handle_info({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
+handle_info({start_send_loop, ClientId},
+            #{mode := normal,
+              status := online,
+              auto_send := stopped} = State) ->
+    schedule_auto_send(initial_send_delay(ClientId)),
+    {noreply, State#{auto_send := running}};
+handle_info({start_send_loop, ClientId},
+            #{mode := normal,
+              auto_send := stopped} = State) ->
+    InitialDelay = initial_send_delay(ClientId),
+    {noreply, State#{auto_send := {pending, InitialDelay}}};
+handle_info({start_send_loop, _ClientId}, State) ->
+    {noreply, State};
 handle_info(auto_send_channel,
             #{mode := normal,
               status := online,
+              auto_send := running,
               role_name := RoleName,
               auto_send_seq := Sequence} = State) ->
     Content = auto_message(RoleName, Sequence),
@@ -185,8 +200,8 @@ handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
                      role_id := RoleId,
                      channel_ids := maps:from_list(
                          [{ChannelId, true} || ChannelId <- ChannelIds])},
-    schedule_mode(NewState),
-    report_result(login, Result, NewState);
+    StartedState = start_mode_after_login(NewState),
+    report_result(login, Result, StartedState);
 handle_response({login_result, {error, _Reason} = Result}, State) ->
     NewState = State#{status := connected,
                      role_id := undefined,
@@ -243,13 +258,22 @@ handle_invalid_packet(Reason,
 handle_invalid_packet(_Reason, State) ->
     State.
 
-schedule_mode(#{mode := observer}) ->
-    schedule_observer_report();
-schedule_mode(#{mode := normal}) ->
-    schedule_auto_send().
+start_mode_after_login(#{mode := observer} = State) ->
+    schedule_observer_report(),
+    State;
+start_mode_after_login(
+        #{mode := normal,
+          auto_send := {pending, InitialDelay}} = State) ->
+    schedule_auto_send(InitialDelay),
+    State#{auto_send := running};
+start_mode_after_login(State) ->
+    State.
 
 schedule_auto_send() ->
-    _ = erlang:send_after(?AUTO_SEND_INTERVAL_MS, self(), auto_send_channel),
+    schedule_auto_send(?AUTO_SEND_INTERVAL_MS).
+
+schedule_auto_send(Delay) ->
+    _ = erlang:send_after(Delay, self(), auto_send_channel),
     ok.
 
 schedule_observer_report() ->
@@ -260,6 +284,9 @@ schedule_observer_report() ->
 auto_message(RoleName, Sequence) ->
     <<RoleName/binary, " auto message ",
       (integer_to_binary(Sequence))/binary>>.
+
+initial_send_delay(ClientId) ->
+    (ClientId - 1) rem ?AUTO_SEND_INTERVAL_MS.
 
 print_result(Action, Result) ->
     io:format("[~p] ~p~n", [Action, Result]).

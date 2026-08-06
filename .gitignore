@@ -1,3 +1,6 @@
 /ebin/
 /erl_crash.dump
+/_build/
+/rebar.lock
 /.codex/project_notes/
+/Chat V1.1 调优报告（试验稿）.md
