@@ -39,4 +39,4 @@ ok = chat_load_test:send_private(1, 2, <<"hello">>).
 
 服务端 Shell 使用 `chat_metrics:snapshot().` 手动采集当前在线数、关键进程邮箱和 BEAM 资源数据。该接口只在调用时读取状态，不启动常驻统计进程。
 
-完整接口见 [Chat V1.1 接口文档](<Chat V1.1 接口文档.md>)，进程架构、协议和当前性能边界见 [Chat V1.1 设计文档](<Chat V1.1 设计文档.md>)。
+当前架构、接口、流程图和测试边界见 [Chat V1.2 设计文档](<docs/Chat V1.2 设计文档.md>)。根目录的 V1.1 文档仅作历史保留，不再维护。

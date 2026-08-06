@@ -1,34 +1,28 @@
 -module(chat_client).
 -behaviour(gen_server).
 
--export([start_link/6]).
+-export([start_link/5]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2]).
 
 -define(AUTO_SEND_INTERVAL_MS, 3000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
 
-start_link(ClientId, Host, Port, RoleName, Password, Mode) ->
+start_link(Host, Port, RoleName, Password, Mode) ->
     gen_server:start_link(
-        ?MODULE, [ClientId, Host, Port, RoleName, Password, Mode], []).
+        ?MODULE, [Host, Port, RoleName, Password, Mode], []).
 
-init([ClientId, Host, Port, RoleName, Password, Mode]) ->
+init([Host, Port, RoleName, Password, Mode]) ->
     Options = [binary, {packet, 4}, {active, true}],
     case gen_tcp:connect(Host, Port, Options) of
         {ok, Socket} ->
-            {ok, #{client_id => ClientId,
-                   socket => Socket,
-                   status => connected,
-                   role_id => undefined,
+            {ok, #{socket => Socket,
                    role_name => RoleName,
-                   password => Password,
-                   channel_ids => #{},
                    action_seq => 1,
-                   action_state => idle,
                    mode => Mode,
                    observer_received => 0,
                    observer_invalid => 0},
-             {continue, login}};
+             {continue, {login, RoleName, Password}}};
         {error, Reason} ->
             {stop, {connect_failed, Reason}}
     end.
@@ -46,20 +40,14 @@ handle_cast({send_channel, ChannelId, Content}, State) ->
     {noreply, do_send_channel(ChannelId, Content, State)};
 handle_cast({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
-handle_cast(stop, State) ->
-    {stop, normal, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-handle_continue(login,
-                #{role_name := RoleName, password := Password} = State) ->
-    LoginState = maps:remove(password, State),
-    {noreply, do_login(RoleName, Password, LoginState)}.
+handle_continue({login, RoleName, Password}, State) ->
+    {noreply, do_login(RoleName, Password, State)}.
 
 handle_info(auto_send_channel,
             #{mode := normal,
-              status := online,
-              action_state := running,
               role_name := RoleName,
               action_seq := Sequence} = State) ->
     Content = auto_message(RoleName, Sequence),
@@ -76,8 +64,6 @@ handle_info(observer_report,
     schedule_observer_report(),
     {noreply, State#{observer_received := 0,
                      observer_invalid := 0}};
-handle_info(stop, State) ->
-    {stop, normal, State};
 handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
     {noreply, handle_server_packet(Packet, State)};
 handle_info({tcp_closed, Socket}, #{socket := Socket} = State) ->
@@ -90,31 +76,26 @@ handle_info(_Info, State) ->
 terminate(_Reason, #{socket := Socket}) ->
     gen_tcp:close(Socket).
 
-do_login(_RoleName, _Password, #{status := online} = State) ->
-    report_result(login, {error, already_logged_in}, State);
-do_login(_RoleName, _Password, #{status := logging_in} = State) ->
-    report_result(login, {error, login_in_progress}, State);
 do_login(RoleName, Password, State) ->
     case normalize_texts([RoleName, Password]) of
         {ok, [RoleNameBinary, PasswordBinary]} ->
             Packet = chat_client_protocol:encode_login(
                 RoleNameBinary, PasswordBinary),
-            SentState = State#{status := logging_in,
-                              role_name := RoleNameBinary},
-            send_packet(login, Packet, SentState, State);
+            send_packet(login, Packet,
+                        State#{role_name := RoleNameBinary});
         {error, Reason} ->
             report_result(login, {error, Reason}, State)
     end.
 
 do_list_channels(State) ->
     Packet = chat_client_protocol:encode_channel_list(),
-    send_packet(list_channels, Packet, State, State).
+    send_packet(list_channels, Packet, State).
 
 do_join_channel(ChannelId, State) when is_integer(ChannelId),
                                        ChannelId >= 0,
                                        ChannelId =< 16#FFFFFFFF ->
     Packet = chat_client_protocol:encode_channel_join(ChannelId),
-    send_packet({join_channel, ChannelId}, Packet, State, State);
+    send_packet({join_channel, ChannelId}, Packet, State);
 do_join_channel(_ChannelId, State) ->
     report_result(join_channel, {error, invalid_channel_id}, State).
 
@@ -122,7 +103,7 @@ do_leave_channel(ChannelId, State) when is_integer(ChannelId),
                                         ChannelId >= 0,
                                         ChannelId =< 16#FFFFFFFF ->
     Packet = chat_client_protocol:encode_channel_leave(ChannelId),
-    send_packet({leave_channel, ChannelId}, Packet, State, State);
+    send_packet({leave_channel, ChannelId}, Packet, State);
 do_leave_channel(_ChannelId, State) ->
     report_result(leave_channel, {error, invalid_channel_id}, State).
 
@@ -132,7 +113,7 @@ do_send_channel(ChannelId, Content, State)
         {ok, ContentBinary} ->
             Packet = chat_client_protocol:encode_channel_send(
                 ChannelId, ContentBinary),
-            send_packet({send_channel, ChannelId}, Packet, State, State);
+            send_packet({send_channel, ChannelId}, Packet, State);
         {error, Reason} ->
             report_result(send_channel, {error, Reason}, State)
     end;
@@ -145,17 +126,17 @@ do_send_private(TargetRoleName, Content, State) ->
             Packet = chat_client_protocol:encode_private_send(
                 TargetRoleNameBinary, ContentBinary),
             send_packet({send_private, TargetRoleNameBinary},
-                        Packet, State, State);
+                        Packet, State);
         {error, Reason} ->
             report_result(send_private, {error, Reason}, State)
     end.
 
-send_packet(Action, Packet, SentState, #{socket := Socket} = CurrentState) ->
+send_packet(Action, Packet, #{socket := Socket} = State) ->
     case gen_tcp:send(Socket, Packet) of
         ok ->
-            SentState;
+            State;
         {error, Reason} ->
-            report_result(Action, {error, {send_failed, Reason}}, CurrentState)
+            report_result(Action, {error, {send_failed, Reason}}, State)
     end.
 
 normalize_texts(Texts) ->
@@ -192,39 +173,15 @@ handle_server_packet(Packet, State) ->
             handle_invalid_packet(Reason, State)
     end.
 
-handle_response({login_result, {ok, RoleId, ChannelIds} = Result}, State) ->
-    NewState = State#{status := online,
-                     role_id := RoleId,
-                     channel_ids := maps:from_list(
-                         [{ChannelId, true} || ChannelId <- ChannelIds])},
-    StartedState = start_mode_after_login(NewState),
-    report_result(login, Result, StartedState);
-handle_response({login_result, {error, _Reason} = Result}, State) ->
-    NewState = State#{status := connected,
-                     role_id := undefined,
-                     role_name := undefined,
-                     channel_ids := #{}},
-    report_result(login, Result, NewState);
-handle_response({channel_list_result, {ok, Channels} = Result}, State) ->
-    JoinedChannels = maps:from_list([
-        {maps:get(channel_id, Channel), true}
-     || Channel <- Channels,
-        maps:get(joined, Channel)]),
-    report_result(list_channels, Result,
-                  State#{channel_ids := JoinedChannels});
-handle_response({channel_join_result, {ok, ChannelId} = Result},
-                #{channel_ids := ChannelIds} = State) ->
-    NewState = State#{channel_ids := maps:put(ChannelId, true, ChannelIds)},
-    report_result(join_channel, Result, NewState);
-handle_response({channel_join_result,
-                 {error, _Reason, _ChannelId} = Result}, State) ->
+handle_response({login_result, {ok, _RoleId, _ChannelIds} = Result}, State) ->
+    report_result(login, Result, start_mode_after_login(State));
+handle_response({login_result, Result}, State) ->
+    report_result(login, Result, State);
+handle_response({channel_list_result, Result}, State) ->
+    report_result(list_channels, Result, State);
+handle_response({channel_join_result, Result}, State) ->
     report_result(join_channel, Result, State);
-handle_response({channel_leave_result, {ok, ChannelId} = Result},
-                #{channel_ids := ChannelIds} = State) ->
-    NewState = State#{channel_ids := maps:remove(ChannelId, ChannelIds)},
-    report_result(leave_channel, Result, NewState);
-handle_response({channel_leave_result,
-                 {error, _Reason, _ChannelId} = Result}, State) ->
+handle_response({channel_leave_result, Result}, State) ->
     report_result(leave_channel, Result, State);
 handle_response({channel_send_result, Result}, State) ->
     report_result(send_channel, Result, State);
@@ -258,11 +215,9 @@ handle_invalid_packet(_Reason, State) ->
 start_mode_after_login(#{mode := observer} = State) ->
     schedule_observer_report(),
     State;
-start_mode_after_login(
-        #{mode := normal,
-          action_state := idle} = State) ->
+start_mode_after_login(#{mode := normal} = State) ->
     schedule_next_action(),
-    State#{action_state := running};
+    State;
 start_mode_after_login(State) ->
     State.
 

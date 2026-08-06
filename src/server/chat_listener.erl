@@ -13,7 +13,7 @@ init([]) ->
     Options = [binary, {packet, 4}, {active, false}, {reuseaddr, true}],
     case gen_tcp:listen(Port, Options) of
         {ok, ListenSocket} ->
-            {ok, #{listen_socket => ListenSocket, port => Port},
+            {ok, #{listen_socket => ListenSocket},
              {continue, accept}};
         {error, Reason} ->
             {stop, {listen_failed, Port, Reason}}

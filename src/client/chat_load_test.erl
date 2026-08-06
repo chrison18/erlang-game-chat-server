@@ -53,16 +53,8 @@ send_channel(_ClientId, _ChannelId, _Content) ->
 send_private(SenderId, TargetId, Content)
   when is_integer(SenderId), SenderId > 0,
        is_integer(TargetId), TargetId > 0 ->
-    case {find_client(SenderId), find_client(TargetId)} of
-        {{ok, SenderPid}, {ok, _TargetPid}} ->
-            gen_server:cast(
-                SenderPid,
-                {send_private, role_name(TargetId), Content});
-        {error, _TargetResult} ->
-            {error, {client_not_found, SenderId}};
-        {_SenderResult, error} ->
-            {error, {client_not_found, TargetId}}
-    end;
+    send_client_command(
+        SenderId, {send_private, role_name(TargetId), Content});
 send_private(_SenderId, _TargetId, _Content) ->
     {error, invalid_client_id}.
 

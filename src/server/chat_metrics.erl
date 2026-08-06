@@ -6,7 +6,8 @@ snapshot() ->
     {RoleCount, RoleQueueTotal, RoleQueueMax} =
         queue_stats(child_pids(role_sup, role_server)),
     {ChannelCount, ChannelQueueTotal, ChannelQueueMax} =
-        queue_stats(child_pids(channel_sup, channel_server)),
+        queue_stats(child_pids(chat_sup, channel_server) ++
+                    child_pids(channel_sup, channel_server)),
     {WorkerCount, WorkerQueueTotal, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
     #{node => node(),
@@ -27,15 +28,14 @@ snapshot() ->
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
 
 child_pids(Supervisor, Module) ->
-    case whereis(Supervisor) of
-        undefined ->
-            [];
-        _SupervisorPid ->
+    try supervisor:which_children(Supervisor) of
+        Children ->
             [ChildPid
-             || {_Id, ChildPid, worker, Modules} <-
-                    supervisor:which_children(Supervisor),
+             || {_Id, ChildPid, worker, Modules} <- Children,
                 is_pid(ChildPid),
                 lists:member(Module, Modules)]
+    catch
+        exit:_Reason -> []
     end.
 
 queue_stats(Pids) ->

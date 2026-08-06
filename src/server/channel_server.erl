@@ -4,32 +4,76 @@
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
--export([start_link/3, join/3, leave/2, send_channel/4]).
+-export([child_spec/1,
+         channels/0,
+         channel/1,
+         start_link/2,
+         join/3,
+         leave/2,
+         send_channel/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
-start_link(ChannelId, Type, Name) ->
-    gen_server:start_link(?MODULE, [ChannelId, Type, Name], []).
+child_spec(ChannelId) ->
+    {ok, ChannelType, _ChannelName} = channel(ChannelId),
+    #{id => {channel_server, ChannelId},
+      start => {channel_server, start_link,
+                [ChannelId, ChannelType]}}.
 
-join(ChannelPid, RoleId, RolePid) ->
-    gen_server:call(ChannelPid, {join, RoleId, RolePid}).
+channels() ->
+    [channel_tuple(ChannelId) || ChannelId <- lists:seq(1, 10)].
 
-leave(ChannelPid, RoleId) ->
-    gen_server:call(ChannelPid, {leave, RoleId}).
+channel(1) -> {ok, ?CHANNEL_TYPE_MAIN, <<"main">>};
+channel(2) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_1">>};
+channel(3) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_2">>};
+channel(4) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_3">>};
+channel(5) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_4">>};
+channel(6) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_5">>};
+channel(7) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_6">>};
+channel(8) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_7">>};
+channel(9) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_8">>};
+channel(10) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_9">>};
+channel(_ChannelId) -> error.
 
-send_channel(#channel_info{channel_type = ?CHANNEL_TYPE_MAIN},
-             RoleId, RoleName, Content) ->
+start_link(ChannelId, Type) ->
+    gen_server:start_link(
+        {local, server_name(ChannelId)}, ?MODULE, [ChannelId, Type], []).
+
+join(ChannelId, RoleId, RolePid) ->
+    case channel(ChannelId) of
+        {ok, _ChannelType, _ChannelName} ->
+            gen_server:call(
+                server_name(ChannelId), {join, RoleId, RolePid});
+        error ->
+            {error, invalid_channel}
+    end.
+
+leave(1, _RoleId) ->
+    {error, cannot_leave_main};
+leave(ChannelId, RoleId) ->
+    case channel(ChannelId) of
+        {ok, _ChannelType, _ChannelName} ->
+            gen_server:call(server_name(ChannelId), {leave, RoleId});
+        error ->
+            {error, invalid_channel}
+    end.
+
+send_channel(1, RoleId, RoleName, Content) ->
     world_broadcast_worker:send(RoleId, RoleName, Content);
-send_channel(#channel_info{channel_pid = ChannelPid},
-             RoleId, RoleName, Content) ->
-    gen_server:call(ChannelPid, {send_channel, RoleId, RoleName, Content}).
+send_channel(ChannelId, RoleId, RoleName, Content) ->
+    case channel(ChannelId) of
+        {ok, ?CHANNEL_TYPE_PUBLIC, _ChannelName} ->
+            gen_server:call(
+                server_name(ChannelId),
+                {send_channel, RoleId, RoleName, Content});
+        error ->
+            {error, invalid_channel}
+    end.
 
-init([ChannelId, Type, Name]) ->
-    ok = reset_world_members(Type),
-    ok = channel_manager:register_channel(ChannelId, Type, Name, self()),
+init([ChannelId, Type]) ->
+    ok = create_world_members(Type),
     {ok, #channel_state{
         channel_id = ChannelId,
-        channel_type = Type,
-        channel_name = Name
+        channel_type = Type
     }}.
 
 handle_call({join, RoleId, RolePid}, _From,
@@ -43,7 +87,6 @@ handle_call({join, RoleId, RolePid}, _From,
         false ->
             MonitorRef = erlang:monitor(process, RolePid),
             Member = #channel_member{
-                role_id = RoleId,
                 role_pid = RolePid,
                 monitor_ref = MonitorRef
             },
@@ -114,17 +157,44 @@ handle_info({'DOWN', MonitorRef, process, _RolePid, _Reason},
 handle_info(_Info, State) ->
     {noreply, State}.
 
-reset_world_members(?CHANNEL_TYPE_MAIN) ->
-    channel_manager:reset_world_members();
-reset_world_members(?CHANNEL_TYPE_PUBLIC) ->
+create_world_members(?CHANNEL_TYPE_MAIN) ->
+    world_channel_members = ets:new(world_channel_members, [
+        named_table,
+        set,
+        protected,
+        {keypos, #world_channel_member.role_id},
+        {read_concurrency, true}
+    ]),
+    ok;
+create_world_members(?CHANNEL_TYPE_PUBLIC) ->
     ok.
 
 add_world_member(?CHANNEL_TYPE_MAIN, RoleId, RolePid) ->
-    channel_manager:add_world_member(RoleId, RolePid);
+    true = ets:insert(world_channel_members, #world_channel_member{
+        role_id = RoleId,
+        role_pid = RolePid
+    }),
+    ok;
 add_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId, _RolePid) ->
     ok.
 
 remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
-    channel_manager:remove_world_member(RoleId);
+    true = ets:delete(world_channel_members, RoleId),
+    ok;
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
+
+channel_tuple(ChannelId) ->
+    {ok, ChannelType, ChannelName} = channel(ChannelId),
+    {ChannelId, ChannelType, ChannelName}.
+
+server_name(1) -> main_channel_server;
+server_name(2) -> public_channel_server_1;
+server_name(3) -> public_channel_server_2;
+server_name(4) -> public_channel_server_3;
+server_name(5) -> public_channel_server_4;
+server_name(6) -> public_channel_server_5;
+server_name(7) -> public_channel_server_6;
+server_name(8) -> public_channel_server_7;
+server_name(9) -> public_channel_server_8;
+server_name(10) -> public_channel_server_9.

@@ -11,6 +11,7 @@ shopt -s nullglob
 SOURCE_FILES=(
     "$PROJECT_DIR"/src/server/*.erl
     "$PROJECT_DIR"/src/client/*.erl
+    "$PROJECT_DIR"/test/*.erl
 )
 
 erlc -Wall \

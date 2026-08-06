@@ -56,7 +56,7 @@ login_role(RolePid, RoleName, Password,
                 role_id = NextRoleId,
                 password = Password
             }),
-            NewState = add_online_role(RolePid, RoleName, NextRoleId, State),
+            NewState = add_online_role(RolePid, RoleName, State),
             {reply, {ok, NextRoleId},
             NewState#{next_role_id := NextRoleId + 1}};
         [#role_account{role_id = RoleId, password = Password}] ->
@@ -66,20 +66,17 @@ login_role(RolePid, RoleName, Password,
                     {reply, {error, already_online}, State};
                 % 账号存在但离线
                 false ->
-                    NewState = add_online_role(RolePid, RoleName, RoleId, State),
+                    NewState = add_online_role(RolePid, RoleName, State),
                     {reply, {ok, RoleId}, NewState}
             end;
         [#role_account{}] ->
             {reply, {error, invalid_login}, State} % 密码错误
     end.
 
-add_online_role(RolePid, RoleName, RoleId,
-                #{monitors := Monitors} = State) ->
+add_online_role(RolePid, RoleName, #{monitors := Monitors} = State) ->
     MonitorRef = erlang:monitor(process, RolePid),
     true = ets:insert(online_roles, #online_role{
         role_name = RoleName,
-        role_id = RoleId,
-        role_pid = RolePid,
-        monitor_ref = MonitorRef
+        role_pid = RolePid
     }),
     State#{monitors := Monitors#{MonitorRef => RoleName}}.

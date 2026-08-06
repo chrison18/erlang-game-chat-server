@@ -10,23 +10,20 @@
 -define(WORKER_COUNT, 8).
 
 start_link(WorkerIndex) ->
-    gen_server:start_link(?MODULE, [WorkerIndex], []).
+    gen_server:start_link(
+        {local, worker_name(WorkerIndex)}, ?MODULE, [], []).
 
 send(RoleId, RoleName, Content) ->
     WorkerIndex = erlang:phash2(RoleId, ?WORKER_COUNT) + 1,
-    case find_worker(WorkerIndex) of
-        {ok, WorkerPid} ->
-            call_worker(WorkerPid, {broadcast, RoleId, RoleName, Content});
-        error ->
-            {error, broadcast_failed}
-    end.
+    call_worker(
+        worker_name(WorkerIndex),
+        {broadcast, RoleId, RoleName, Content}).
 
 worker_count() ->
     ?WORKER_COUNT.
 
-init([WorkerIndex]) ->
-    ok = channel_manager:register_world_worker(WorkerIndex, self()),
-    {ok, #{worker_index => WorkerIndex}}.
+init([]) ->
+    {ok, undefined}.
 
 handle_call({broadcast, RoleId, RoleName, Content}, _From, State) ->
     case ets:member(world_channel_members, RoleId) of
@@ -45,14 +42,8 @@ handle_cast(_Request, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-find_worker(WorkerIndex) ->
-    try channel_manager:world_worker(WorkerIndex)
-    catch
-        error:badarg -> error
-    end.
-
-call_worker(WorkerPid, Request) ->
-    try gen_server:call(WorkerPid, Request) of
+call_worker(Worker, Request) ->
+    try gen_server:call(Worker, Request) of
         Reply -> Reply
     catch
         exit:_Reason -> {error, broadcast_failed}
@@ -69,3 +60,12 @@ broadcast(SenderRoleId, SenderRoleName, Content) ->
         ok,
         world_channel_members
     ).
+
+worker_name(1) -> world_broadcast_worker_1;
+worker_name(2) -> world_broadcast_worker_2;
+worker_name(3) -> world_broadcast_worker_3;
+worker_name(4) -> world_broadcast_worker_4;
+worker_name(5) -> world_broadcast_worker_5;
+worker_name(6) -> world_broadcast_worker_6;
+worker_name(7) -> world_broadcast_worker_7;
+worker_name(8) -> world_broadcast_worker_8.

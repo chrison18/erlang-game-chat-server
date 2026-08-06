@@ -10,15 +10,9 @@ start_link() ->
 start_client(ClientId, Host, Port, RoleName, Password, Mode) ->
     ChildSpec = #{id => {chat_client, ClientId},
                   start => {chat_client, start_link,
-                            [ClientId, Host, Port, RoleName, Password, Mode]},
-                  restart => temporary,
-                  shutdown => 5000,
-                  type => worker,
-                  modules => [chat_client]},
+                            [Host, Port, RoleName, Password, Mode]},
+                  restart => temporary},
     supervisor:start_child(?MODULE, ChildSpec).
 
 init([]) ->
-    SupFlags = #{strategy => one_for_one,
-                 intensity => 5,
-                 period => 10},
-    {ok, {SupFlags, []}}.
+    {ok, {#{strategy => one_for_one}, []}}.

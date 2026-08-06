@@ -104,45 +104,31 @@ handle_authenticated_request(ProtoId, Request, Socket) ->
 
 handle_business_request(list_channels, Socket, _RoleId) ->
     JoinedChannels = get(channel_ids),
-    ChannelRecords = lists:keysort(
-        #channel_info.channel_id,
-        ets:tab2list(channel_info)
-    ),
     ChannelList = [
         {ChannelId,
          ChannelType,
          joined_value(maps:is_key(ChannelId, JoinedChannels)),
          ChannelName}
-     || #channel_info{channel_id = ChannelId,
-                      channel_type = ChannelType,
-                      channel_name = ChannelName} <- ChannelRecords],
+     || {ChannelId, ChannelType, ChannelName} <- channel_server:channels()],
     send_packet(Socket,
         chat_server_protocol:encode_channel_list_result(ChannelList));
 handle_business_request({join_channel, ChannelId}, Socket, RoleId) ->
-    Result = join_channel(ChannelId, RoleId),
-    case Result of
-        {ok, ChannelId} ->
-            put(channel_ids, maps:put(ChannelId, true, get(channel_ids)));
-        {error, _Reason} ->
-            ok
-    end,
-    ProtocolResult = case Result of
-        {ok, ChannelId} -> {ok, ChannelId};
-        {error, Reason} -> {error, Reason, ChannelId}
+    ProtocolResult = case channel_server:join(ChannelId, RoleId, self()) of
+        {ok, ChannelId} = Result ->
+            put(channel_ids, maps:put(ChannelId, true, get(channel_ids))),
+            Result;
+        {error, Reason} ->
+            {error, Reason, ChannelId}
     end,
     send_packet(Socket,
         chat_server_protocol:encode_channel_join_result(ProtocolResult));
 handle_business_request({leave_channel, ChannelId}, Socket, RoleId) ->
-    Result = leave_channel(ChannelId, RoleId),
-    case Result of
-        {ok, ChannelId} ->
-            put(channel_ids, maps:remove(ChannelId, get(channel_ids)));
-        {error, _Reason} ->
-            ok
-    end,
-    ProtocolResult = case Result of
-        {ok, ChannelId} -> {ok, ChannelId};
-        {error, Reason} -> {error, Reason, ChannelId}
+    ProtocolResult = case channel_server:leave(ChannelId, RoleId) of
+        {ok, ChannelId} = Result ->
+            put(channel_ids, maps:remove(ChannelId, get(channel_ids))),
+            Result;
+        {error, Reason} ->
+            {error, Reason, ChannelId}
     end,
     send_packet(Socket,
         chat_server_protocol:encode_channel_leave_result(ProtocolResult));
@@ -202,41 +188,24 @@ join_initial_channels(RoleId) ->
     ChannelIds = [1 | lists:sublist(RandomizedPublicIds, PublicCount)],
     lists:foreach(
         fun(ChannelId) ->
-            {ok, ChannelId} = join_channel(ChannelId, RoleId)
+            {ok, ChannelId} =
+                channel_server:join(ChannelId, RoleId, self())
         end,
         ChannelIds
     ),
     ChannelIds.
 
-join_channel(ChannelId, RoleId) ->
-    case ets:lookup(channel_info, ChannelId) of
-        [#channel_info{channel_pid = ChannelPid}] ->
-            channel_server:join(ChannelPid, RoleId, self());
-        [] ->
-            {error, invalid_channel}
-    end.
-
-leave_channel(1, _RoleId) ->
-    {error, cannot_leave_main};
-leave_channel(ChannelId, RoleId) ->
-    case ets:lookup(channel_info, ChannelId) of
-        [#channel_info{channel_pid = ChannelPid}] ->
-            channel_server:leave(ChannelPid, RoleId);
-        [] ->
-            {error, invalid_channel}
-    end.
-
 send_channel_message(ChannelId, RoleId, RoleName, Content) ->
-    case ets:lookup(channel_info, ChannelId) of
-        [] ->
+    case channel_server:channel(ChannelId) of
+        error ->
             {error, invalid_channel};
-        [#channel_info{} = ChannelInfo] ->
+        {ok, _ChannelType, _ChannelName} ->
             case maps:is_key(ChannelId, get(channel_ids)) of
                 false ->
                     {error, not_joined};
                 true ->
                     channel_server:send_channel(
-                        ChannelInfo, RoleId, RoleName, Content)
+                        ChannelId, RoleId, RoleName, Content)
             end
     end.
 
