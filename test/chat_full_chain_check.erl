@@ -1,6 +1,7 @@
 -module(chat_full_chain_check).
 
 -include("chat_protocol.hrl").
+-include("chat_record.hrl").
 
 -export([run/0]).
 
@@ -25,6 +26,7 @@ check(Port) ->
     check_login_errors(Port),
     check_protocol_errors(Port),
     check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId),
+    check_role_packet_batch(Alice, AliceId),
     check_private_flow(Alice, AliceId, Bob, BobId),
     check_worker_recovery(Alice, AliceId),
     gen_tcp:close(Bob),
@@ -122,9 +124,32 @@ check_private_flow(Alice, AliceId, Bob, _BobId) ->
     {private_send_result,
      {error, target_offline, <<"missing">>}} = recv(Alice).
 
+check_role_packet_batch(Alice, AliceId) ->
+    [#online_role{role_pid = AliceRolePid}] =
+        ets:lookup(online_roles, <<"alice">>),
+    Packets = [
+        chat_server_protocol:encode_channel_push(
+            1, AliceId, <<"alice">>, <<"batch-1">>),
+        chat_server_protocol:encode_channel_push(
+            1, AliceId, <<"alice">>, <<"batch-2">>)
+    ],
+    BatchPacket = chat_server_protocol:encode_channel_push_batch(Packets),
+    gen_server:cast(AliceRolePid, {push_channel_batch, BatchPacket}),
+    {channel_push_batch,
+     [#{channel_id := 1,
+        sender_role_id := AliceId,
+        sender_role_name := <<"alice">>,
+        content := <<"batch-1">>},
+      #{channel_id := 1,
+        sender_role_id := AliceId,
+        sender_role_name := <<"alice">>,
+        content := <<"batch-2">>}]} = recv(Alice),
+    {error, timeout} = gen_tcp:recv(Alice, 0, 100),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_CHANNEL_PUSH_BATCH:16, 1:16, 8:32, 1:8>>).
+
 check_worker_recovery(Alice, AliceId) ->
-    WorkerId = {world_broadcast_worker,
-                erlang:phash2(AliceId, world_broadcast_worker:worker_count()) + 1},
+    WorkerId = {world_broadcast_worker, 1},
     ok = supervisor:terminate_child(channel_sup, WorkerId),
     send(Alice, chat_client_protocol:encode_channel_send(1, <<"worker-down">>)),
     {channel_send_result, {error, broadcast_failed, 1}} = recv(Alice),
@@ -138,17 +163,44 @@ check_real_client(Port) ->
     {ok, ClientSup} = chat_client_sup:start_link(),
     unlink(ClientSup),
     {ok, ClientPid} = chat_client_sup:start_client(
-        101, "127.0.0.1", Port, <<"client_101">>, <<"123456">>, normal),
+        101, "127.0.0.1", Port, <<"client_101">>, <<"123456">>,
+        {normal, 101, 101, 101}),
     wait_until(fun() -> ets:info(online_roles, size) =:= 3 end),
     State = sys:get_state(ClientPid),
+    101 = maps:get(client_id, State),
+    {101, 101} = maps:get(client_range, State),
+    ClientChannels = maps:get(channel_ids, State),
+    check_initial_channels(ClientChannels),
     false = lists:any(
         fun(Key) -> maps:is_key(Key, State) end,
-        [client_id, status, role_id, password, channel_ids, action_state]),
+        [status, role_id, password, action_state]),
+    {ok, ObserverPid} = chat_client_sup:start_client(
+        batch_observer, "127.0.0.1", Port,
+        <<"batch_observer">>, <<"123456">>, observer),
+    wait_until(fun() -> ets:info(online_roles, size) =:= 4 end),
+    NewChannel = hd(lists:seq(2, 10) -- ClientChannels),
+    gen_server:cast(ClientPid, {join_channel, NewChannel}),
+    wait_until(fun() ->
+        lists:member(NewChannel,
+                     maps:get(channel_ids, sys:get_state(ClientPid)))
+    end),
+    gen_server:cast(ClientPid, {leave_channel, NewChannel}),
+    wait_until(fun() ->
+        not lists:member(NewChannel,
+                         maps:get(channel_ids, sys:get_state(ClientPid)))
+    end),
     ok = chat_load_test:send_channel(101, 1, <<"manual">>),
     expect_push_content(Sink, <<"client_101">>, <<"manual">>),
+    wait_until(fun() ->
+        ObserverState = sys:get_state(ObserverPid),
+        maps:get(observer_received, ObserverState) >= 1 andalso
+        maps:get(observer_invalid, ObserverState) =:= 0
+    end),
+    ok = gen_server:stop(ObserverPid),
     ok = chat_load_test:send_private(101, 999999, <<"offline">>),
-    expect_push_content(Sink, <<"client_101">>,
-                        <<"client_101 auto message 1">>),
+    wait_until(fun() ->
+        maps:get(action_seq, sys:get_state(ClientPid)) >= 2
+    end),
     ok = gen_server:stop(ClientPid),
     gen_tcp:close(Sink),
     exit(ClientSup, shutdown),
@@ -189,10 +241,20 @@ ensure_joined(Socket, ChannelId) ->
     end.
 
 expect_channel_push(Socket, ChannelId, SenderId, SenderName, Content) ->
-    {channel_push, #{channel_id := ChannelId,
+    case recv(Socket) of
+        {channel_push, Message} ->
+            check_channel_push(
+                Message, ChannelId, SenderId, SenderName, Content);
+        {channel_push_batch, [Message]} ->
+            check_channel_push(
+                Message, ChannelId, SenderId, SenderName, Content)
+    end.
+
+check_channel_push(#{channel_id := ChannelId,
                      sender_role_id := SenderId,
                      sender_role_name := SenderName,
-                     content := Content}} = recv(Socket),
+                     content := Content},
+                   ChannelId, SenderId, SenderName, Content) ->
     ok.
 
 expect_push_content(Socket, SenderName, Content) ->
@@ -200,6 +262,17 @@ expect_push_content(Socket, SenderName, Content) ->
         {channel_push, #{sender_role_name := SenderName,
                          content := Content}} ->
             ok;
+        {channel_push_batch, Messages} ->
+            case lists:any(
+                     fun(#{sender_role_name := MessageSender,
+                           content := MessageContent}) ->
+                         MessageSender =:= SenderName andalso
+                         MessageContent =:= Content
+                     end,
+                     Messages) of
+                true -> ok;
+                false -> expect_push_content(Socket, SenderName, Content)
+            end;
         _Other ->
             expect_push_content(Socket, SenderName, Content)
     end.

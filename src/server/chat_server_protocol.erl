@@ -9,6 +9,7 @@
          encode_channel_leave_result/1,
          encode_channel_send_result/1,
          encode_channel_push/4,
+         encode_channel_push_batch/1,
          encode_private_send_result/1,
          encode_private_push/3,
          encode_error/2]).
@@ -115,6 +116,14 @@ encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
     SenderNameLength = byte_size(SenderRoleName),
     <<?PROTO_CHANNEL_PUSH:16, ChannelId:32, SenderRoleId:32,
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
+
+encode_channel_push_batch(Packets) ->
+    PacketData = [<<(byte_size(Packet)):32, Packet/binary>>
+                  || Packet <- Packets],
+    iolist_to_binary([
+        <<?PROTO_CHANNEL_PUSH_BATCH:16, (length(Packets)):16>>,
+        PacketData
+    ]).
 
 encode_private_send_result({ok, TargetRoleName}) ->
     encode_private_send_result(?RESULT_SUCCESS, TargetRoleName);

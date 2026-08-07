@@ -69,6 +69,9 @@ decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16,
           decode_channel_send_result(ResultCode, ChannelId)}};
 decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16, _Data/binary>>) ->
     {error, invalid_packet};
+decode_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16,
+                MessageCount:16, MessageData/binary>>) ->
+    decode_channel_push_batch(MessageCount, MessageData, []);
 decode_packet(<<?PROTO_CHANNEL_PUSH:16, ChannelId:32, SenderRoleId:32,
                 SenderNameLength:16, Data/binary>>) ->
     case Data of
@@ -116,6 +119,27 @@ decode_error(?ERROR_NOT_LOGGED_IN) -> not_logged_in;
 decode_error(?ERROR_INVALID_PACKET) -> invalid_packet;
 decode_error(?ERROR_UNKNOWN_PROTO) -> unknown_proto;
 decode_error(ErrorCode) -> {unknown_error, ErrorCode}.
+
+decode_channel_push_batch(0, <<>>, Messages) ->
+    {ok, {channel_push_batch, lists:reverse(Messages)}};
+decode_channel_push_batch(Count,
+                          <<PacketLength:32, Data/binary>>,
+                          Messages)
+  when Count > 0 ->
+    case Data of
+        <<Packet:PacketLength/binary, RemainingData/binary>> ->
+            case decode_packet(Packet) of
+                {ok, {channel_push, Message}} ->
+                    decode_channel_push_batch(
+                        Count - 1, RemainingData, [Message | Messages]);
+                _Error ->
+                    {error, invalid_packet}
+            end;
+        _ ->
+            {error, invalid_packet}
+    end;
+decode_channel_push_batch(_Count, _Data, _Messages) ->
+    {error, invalid_packet}.
 
 decode_channels(0, <<>>, Acc) ->
     {ok, lists:reverse(Acc)};

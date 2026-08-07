@@ -17,7 +17,8 @@ start(StartId, EndId)
         none ->
             Host = application:get_env(chat, client_host, ?DEFAULT_HOST),
             Port = application:get_env(chat, port, ?DEFAULT_PORT),
-            start_clients(StartId, EndId, Host, Port, 0);
+            start_clients(StartId, EndId, Host, Port,
+                          {StartId, EndId}, 0);
         ClientId ->
             {error, {client_already_started, ClientId}}
     end;
@@ -58,19 +59,21 @@ send_private(SenderId, TargetId, Content)
 send_private(_SenderId, _TargetId, _Content) ->
     {error, invalid_client_id}.
 
-start_clients(ClientId, EndId, _Host, _Port, Count)
+start_clients(ClientId, EndId, _Host, _Port, _ClientRange, Count)
   when ClientId > EndId ->
     {ok, Count};
-start_clients(ClientId, EndId, Host, Port, Count) ->
+start_clients(ClientId, EndId, Host, Port,
+              {StartId, EndId} = ClientRange, Count) ->
     case chat_client_sup:start_client(
              ClientId,
              Host,
              Port,
              role_name(ClientId),
              ?DEFAULT_PASSWORD,
-             normal) of
+             {normal, ClientId, StartId, EndId}) of
         {ok, _ClientPid} ->
-            start_clients(ClientId + 1, EndId, Host, Port, Count + 1);
+            start_clients(ClientId + 1, EndId, Host, Port,
+                          ClientRange, Count + 1);
         {error, Reason} ->
             {error, {client_start_failed, ClientId, Reason}}
     end.

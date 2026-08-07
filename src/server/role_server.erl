@@ -21,7 +21,7 @@ handle_cast({push_channel, ChannelId, SenderRoleId, SenderRoleName, Content},
     Packet = chat_server_protocol:encode_channel_push(
         ChannelId, SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
-handle_cast({push_channel_packet, Packet}, #{socket := Socket} = State) ->
+handle_cast({push_channel_batch, Packet}, #{socket := Socket} = State) ->
     handle_push_send(Socket, Packet, State);
 handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
             #{socket := Socket} = State) ->
