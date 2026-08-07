@@ -25,13 +25,16 @@ check(Port) ->
     check_initial_channels(AliceChannels),
     check_login_errors(Port),
     check_protocol_errors(Port),
+    check_world_member_shards(2),
     check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId),
     check_role_packet_batch(Alice, AliceId),
+    check_world_batch_order(Alice, AliceId, Bob),
     check_private_flow(Alice, AliceId, Bob, BobId),
     check_worker_recovery(Alice, AliceId),
     gen_tcp:close(Bob),
     wait_until(fun() -> ets:info(online_roles, size) =:= 1 end),
-    wait_until(fun() -> ets:info(world_channel_members, size) =:= 1 end),
+    wait_until(fun() -> world_member_count() =:= 1 end),
+    check_world_member_shards(1),
     send(Alice, chat_client_protocol:encode_private_send(
         <<"bob">>, <<"after-close">>)),
     {private_send_result, {error, target_offline, <<"bob">>}} = recv(Alice),
@@ -148,8 +151,20 @@ check_role_packet_batch(Alice, AliceId) ->
     {error, invalid_packet} = chat_client_protocol:decode_packet(
         <<?PROTO_CHANNEL_PUSH_BATCH:16, 1:16, 8:32, 1:8>>).
 
+check_world_batch_order(Alice, AliceId, Bob) ->
+    send(Alice, chat_client_protocol:encode_channel_send(1, <<"order-1">>)),
+    send(Alice, chat_client_protocol:encode_channel_send(1, <<"order-2">>)),
+    [<<"order-1">>, <<"order-2">>] =
+        recv_world_contents(Alice, AliceId, 2, 2),
+    [<<"order-1">>, <<"order-2">>] =
+        recv_world_contents(Bob, AliceId, 2, 0),
+    {error, timeout} = gen_tcp:recv(Alice, 0, 100),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100).
+
 check_worker_recovery(Alice, AliceId) ->
-    WorkerId = {world_broadcast_worker, 1},
+    WorkerIndex = erlang:phash2(
+        AliceId, world_broadcast_worker:worker_count()) + 1,
+    WorkerId = {world_broadcast_worker, WorkerIndex},
     ok = supervisor:terminate_child(channel_sup, WorkerId),
     send(Alice, chat_client_protocol:encode_channel_send(1, <<"worker-down">>)),
     {channel_send_result, {error, broadcast_failed, 1}} = recv(Alice),
@@ -225,13 +240,72 @@ check_main_restart(Alice) ->
         maps:get(channel_count, Snapshot) =:= 10 andalso
         maps:get(world_worker_count, Snapshot) =:= 8
     end),
-    true = whereis(main_channel_server) =:=
-        ets:info(world_channel_members, owner).
+    check_world_member_shards(0).
 
 check_restart_accepts_login(Port) ->
     {Socket, _RoleId, _Channels} = login(Port, <<"after_restart">>, <<"pw">>),
+    check_world_member_shards(1),
     gen_tcp:close(Socket),
-    wait_until(fun() -> ets:info(online_roles, size) =:= 0 end).
+    wait_until(fun() -> ets:info(online_roles, size) =:= 0 end),
+    wait_until(fun() -> world_member_count() =:= 0 end).
+
+check_world_member_shards(ExpectedCount) ->
+    Tables = channel_server:world_member_tables(),
+    8 = length(Tables),
+    MainPid = whereis(main_channel_server),
+    true = lists:all(
+        fun(Table) -> ets:info(Table, owner) =:= MainPid end,
+        Tables),
+    Members = lists:append([ets:tab2list(Table) || Table <- Tables]),
+    ExpectedCount = length(Members),
+    RoleIds = [RoleId || #world_channel_member{role_id = RoleId} <- Members],
+    ExpectedCount = length(lists:usort(RoleIds)),
+    true = lists:all(
+        fun(RoleId) ->
+            [Table] = [MemberTable || MemberTable <- Tables,
+                                      ets:member(MemberTable, RoleId)],
+            channel_server:world_member_table(RoleId) =:= Table
+        end,
+        RoleIds).
+
+world_member_count() ->
+    lists:sum([ets:info(Table, size)
+               || Table <- channel_server:world_member_tables()]).
+
+recv_world_contents(Socket, SenderId, ContentCount, ResultCount) ->
+    recv_world_contents(
+        Socket, SenderId, ContentCount, ResultCount, [], 0).
+
+recv_world_contents(_Socket, _SenderId, ContentCount, ResultCount,
+                    Contents, ResultCount)
+  when length(Contents) =:= ContentCount ->
+    Contents;
+recv_world_contents(Socket, SenderId, ContentCount, ResultCount,
+                    Contents, Results) ->
+    case recv(Socket) of
+        {channel_send_result, {ok, 1}} ->
+            recv_world_contents(
+                Socket, SenderId, ContentCount, ResultCount,
+                Contents, Results + 1);
+        {channel_push, Message} ->
+            recv_world_contents(
+                Socket, SenderId, ContentCount, ResultCount,
+                Contents ++ message_contents([Message], SenderId), Results);
+        {channel_push_batch, Messages} ->
+            recv_world_contents(
+                Socket, SenderId, ContentCount, ResultCount,
+                Contents ++ message_contents(Messages, SenderId), Results)
+    end.
+
+message_contents(Messages, SenderId) ->
+    lists:map(
+        fun(#{channel_id := 1,
+              sender_role_id := MessageSenderId,
+              content := Content}) ->
+            SenderId = MessageSenderId,
+            Content
+        end,
+        Messages).
 
 ensure_joined(Socket, ChannelId) ->
     send(Socket, chat_client_protocol:encode_channel_join(ChannelId)),

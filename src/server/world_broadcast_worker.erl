@@ -7,53 +7,53 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2, handle_info/2]).
 
 -define(WORLD_CHANNEL_ID, 1).
--define(WORKER_COUNT, 8).
--define(COLLECTOR_WORKER_INDEX, 1).
--define(DELIVERY_WORKER_COUNT, ?WORKER_COUNT - 1).
--define(BATCH_WINDOW_MS, 10).
--define(BATCH_MAX_MESSAGES, 32).
+-define(BATCH_WINDOW_MS, 80).
+-define(BATCH_MAX_MESSAGES, 256).
 
 start_link(WorkerIndex) ->
     gen_server:start_link(
-        {local, worker_name(WorkerIndex)}, ?MODULE, [], []).
+        {local, worker_name(WorkerIndex)}, ?MODULE, [WorkerIndex], []).
 
 send(RoleId, RoleName, Content) ->
-    call_worker(
-        worker_name(?COLLECTOR_WORKER_INDEX),
-        {broadcast, RoleId, RoleName, Content}).
+    case ets:member(channel_server:world_member_table(RoleId), RoleId) of
+        false ->
+            {error, not_joined};
+        true ->
+            case worker_pids() of
+                {ok, Workers} ->
+                    Packet = chat_server_protocol:encode_channel_push(
+                        ?WORLD_CHANNEL_ID, RoleId, RoleName, Content),
+                    lists:foreach(
+                        fun(Worker) ->
+                            gen_server:cast(Worker, {broadcast, Packet})
+                        end,
+                        Workers),
+                    {ok, ?WORLD_CHANNEL_ID};
+                error ->
+                    {error, broadcast_failed}
+            end
+    end.
 
 worker_count() ->
-    ?WORKER_COUNT.
+    length(channel_server:world_member_tables()).
 
-init([]) ->
-    {ok, #{packets => [], batch_size => 0, flush_ref => undefined}}.
+init([WorkerIndex]) ->
+    {ok, #{worker_index => WorkerIndex,
+           packets => [],
+           batch_size => 0,
+           flush_ref => undefined}}.
 
-handle_call({broadcast, RoleId, RoleName, Content}, _From, State) ->
-    case ets:member(world_channel_members, RoleId) of
-        false ->
-            {reply, {error, not_joined}, State};
-        true ->
-            Packet = chat_server_protocol:encode_channel_push(
-                ?WORLD_CHANNEL_ID, RoleId, RoleName, Content),
-            {NewState, BatchFull} = enqueue(Packet, State),
-            case BatchFull of
-                true ->
-                    {reply, {ok, ?WORLD_CHANNEL_ID}, NewState,
-                     {continue, flush_batch}};
-                false ->
-                    {reply, {ok, ?WORLD_CHANNEL_ID}, NewState}
-            end
-    end;
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
-handle_cast({deliver_batch, BatchPacket, RolePids}, State) ->
-    lists:foreach(
-        fun(RolePid) ->
-            gen_server:cast(RolePid, {push_channel_batch, BatchPacket})
-        end,
-        RolePids),
-    {noreply, State};
+handle_cast({broadcast, Packet}, State) ->
+    {NewState, BatchFull} = enqueue(Packet, State),
+    case BatchFull of
+        true ->
+            {noreply, NewState, {continue, flush_batch}};
+        false ->
+            {noreply, NewState}
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -65,11 +65,12 @@ handle_info({flush_batch, Ref}, #{flush_ref := Ref} = State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-call_worker(Worker, Request) ->
-    try gen_server:call(Worker, Request) of
-        Reply -> Reply
-    catch
-        exit:_Reason -> {error, broadcast_failed}
+worker_pids() ->
+    Workers = [whereis(worker_name(WorkerIndex))
+               || WorkerIndex <- lists:seq(1, worker_count())],
+    case lists:all(fun erlang:is_pid/1, Workers) of
+        true -> {ok, Workers};
+        false -> error
     end.
 
 enqueue(Packet, #{packets := Packets,
@@ -87,34 +88,23 @@ enqueue(Packet, #{packets := Packets, batch_size := BatchSize} = State) ->
     {State#{packets := [Packet | Packets], batch_size := NewSize},
      NewSize >= ?BATCH_MAX_MESSAGES}.
 
-flush_batch(#{packets := Packets} = State) ->
-    broadcast(lists:reverse(Packets)),
+flush_batch(#{worker_index := WorkerIndex, packets := Packets} = State) ->
+    broadcast(lists:reverse(Packets), WorkerIndex),
     State#{packets := [], batch_size := 0, flush_ref := undefined}.
 
-broadcast([]) ->
+broadcast([], _WorkerIndex) ->
     ok;
-broadcast(Packets) ->
+broadcast(Packets, WorkerIndex) ->
     BatchPacket = chat_server_protocol:encode_channel_push_batch(Packets),
-    RecipientGroups = ets:foldl(
-        fun(#world_channel_member{role_id = RoleId,
-                                  role_pid = RolePid}, Groups) ->
-            GroupIndex = erlang:phash2(RoleId, ?DELIVERY_WORKER_COUNT) + 1,
-            RolePids = element(GroupIndex, Groups),
-            setelement(GroupIndex, Groups, [RolePid | RolePids])
+    MemberTable = lists:nth(
+        WorkerIndex, channel_server:world_member_tables()),
+    ets:foldl(
+        fun(#world_channel_member{role_pid = RolePid}, ok) ->
+            gen_server:cast(RolePid, {push_channel_batch, BatchPacket}),
+            ok
         end,
-        erlang:make_tuple(?DELIVERY_WORKER_COUNT, []),
-        world_channel_members),
-    deliver_groups(BatchPacket, RecipientGroups, 1).
-
-deliver_groups(_BatchPacket, _RecipientGroups, GroupIndex)
-  when GroupIndex > ?DELIVERY_WORKER_COUNT ->
-    ok;
-deliver_groups(BatchPacket, RecipientGroups, GroupIndex) ->
-    WorkerIndex = GroupIndex + ?COLLECTOR_WORKER_INDEX,
-    gen_server:cast(
-        worker_name(WorkerIndex),
-        {deliver_batch, BatchPacket, element(GroupIndex, RecipientGroups)}),
-    deliver_groups(BatchPacket, RecipientGroups, GroupIndex + 1).
+        ok,
+        MemberTable).
 
 worker_name(1) -> world_broadcast_worker_1;
 worker_name(2) -> world_broadcast_worker_2;

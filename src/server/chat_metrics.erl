@@ -13,7 +13,8 @@ snapshot() ->
     #{node => node(),
       schedulers_online => erlang:system_info(schedulers_online),
       online_count => table_size(online_roles),
-      world_member_count => table_size(world_channel_members),
+      world_member_count => lists:sum([
+          table_size(Table) || Table <- channel_server:world_member_tables()]),
       role_count => RoleCount,
       role_queue_total => RoleQueueTotal,
       role_queue_max => RoleQueueMax,

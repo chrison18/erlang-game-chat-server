@@ -7,6 +7,8 @@
 -export([child_spec/1,
          channels/0,
          channel/1,
+         world_member_tables/0,
+         world_member_table/1,
          start_link/2,
          join/3,
          leave/2,
@@ -21,6 +23,20 @@ child_spec(ChannelId) ->
 
 channels() ->
     [channel_tuple(ChannelId) || ChannelId <- lists:seq(1, 10)].
+
+world_member_tables() ->
+    [world_channel_members_1,
+     world_channel_members_2,
+     world_channel_members_3,
+     world_channel_members_4,
+     world_channel_members_5,
+     world_channel_members_6,
+     world_channel_members_7,
+     world_channel_members_8].
+
+world_member_table(RoleId) ->
+    Tables = world_member_tables(),
+    lists:nth(erlang:phash2(RoleId, length(Tables)) + 1, Tables).
 
 channel(1) -> {ok, ?CHANNEL_TYPE_MAIN, <<"main">>};
 channel(2) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_1">>};
@@ -158,19 +174,23 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 create_world_members(?CHANNEL_TYPE_MAIN) ->
-    world_channel_members = ets:new(world_channel_members, [
-        named_table,
-        set,
-        protected,
-        {keypos, #world_channel_member.role_id},
-        {read_concurrency, true}
-    ]),
+    lists:foreach(
+        fun(Table) ->
+            Table = ets:new(Table, [
+                named_table,
+                set,
+                protected,
+                {keypos, #world_channel_member.role_id},
+                {read_concurrency, true}
+            ])
+        end,
+        world_member_tables()),
     ok;
 create_world_members(?CHANNEL_TYPE_PUBLIC) ->
     ok.
 
 add_world_member(?CHANNEL_TYPE_MAIN, RoleId, RolePid) ->
-    true = ets:insert(world_channel_members, #world_channel_member{
+    true = ets:insert(world_member_table(RoleId), #world_channel_member{
         role_id = RoleId,
         role_pid = RolePid
     }),
@@ -179,7 +199,7 @@ add_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId, _RolePid) ->
     ok.
 
 remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
-    true = ets:delete(world_channel_members, RoleId),
+    true = ets:delete(world_member_table(RoleId), RoleId),
     ok;
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
