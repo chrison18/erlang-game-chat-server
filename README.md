@@ -29,7 +29,16 @@ ok = chat_load_test:start_observer().
 {ok, 2} = chat_load_test:start(1, 2).
 ok = chat_load_test:send_channel(1, 1, <<"hello">>).
 ok = chat_load_test:send_private(1, 2, <<"hello">>).
+ok = chat_load_test:set_feedback(1, true).
+chat_load_test:position(1).
+ok = chat_load_test:move(1, down).
+ok = chat_load_test:teleport(1, 20, 30).
+ok = chat_load_test:send_nearby(1, <<"hello nearby">>).
 ```
+
+普通客户端默认不打印结果，避免压测时淹没 Shell。手工测试时可对指定客户端调用
+`set_feedback/2`；服务端回复到达后会打印操作成功或失败，`position/1` 返回最近一次
+服务端已确认的位置。再次调用 `set_feedback(ClientId, false)` 可恢复静默。
 
 `chat_load_test` 不是进程，不保存 ClientId 到 PID 的映射。它通过 `chat_client_sup`
 启动客户端，并在手工操作时从 supervisor 子进程中查找 ClientId。每个 `chat_client`

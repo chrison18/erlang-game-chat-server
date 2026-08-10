@@ -18,6 +18,8 @@ init([Host, Port, RoleName, Password, Mode]) ->
         {ok, Socket} ->
             State = mode_state(Mode, #{socket => Socket,
                                        role_name => RoleName,
+                                       position => undefined,
+                                       feedback => false,
                                        action_seq => 1,
                                        observer_received => 0,
                                        observer_invalid => 0}),
@@ -27,6 +29,13 @@ init([Host, Port, RoleName, Password, Mode]) ->
             {stop, {connect_failed, Reason}}
     end.
 
+handle_call(position, _From, #{position := undefined} = State) ->
+    {reply, {error, not_logged_in}, State};
+handle_call(position, _From, #{position := Position} = State) ->
+    {reply, {ok, Position}, State};
+handle_call({set_feedback, Enabled}, _From, State)
+  when is_boolean(Enabled) ->
+    {reply, ok, State#{feedback := Enabled}};
 handle_call(Request, _From, State) ->
     {stop, {unsupported_call, Request}, State}.
 
@@ -40,6 +49,12 @@ handle_cast({send_channel, ChannelId, Content}, State) ->
     {noreply, do_send_channel(ChannelId, Content, State)};
 handle_cast({send_private, TargetRoleName, Content}, State) ->
     {noreply, do_send_private(TargetRoleName, Content, State)};
+handle_cast({move, Direction}, State) ->
+    {noreply, do_move(Direction, State)};
+handle_cast({teleport, X, Y}, State) ->
+    {noreply, do_teleport(X, Y, State)};
+handle_cast({send_nearby, Content}, State) ->
+    {noreply, do_send_nearby(Content, State)};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -131,6 +146,31 @@ do_send_private(TargetRoleName, Content, State) ->
             report_result(send_private, {error, Reason}, State)
     end.
 
+do_move(Direction, State)
+  when Direction =:= up; Direction =:= down;
+       Direction =:= left; Direction =:= right ->
+    Packet = chat_client_protocol:encode_move(Direction),
+    send_packet({move, Direction}, Packet, State);
+do_move(_Direction, State) ->
+    report_result(move, {error, invalid_direction}, State).
+
+do_teleport(X, Y, State)
+  when is_integer(X), X >= 0, X =< 255,
+       is_integer(Y), Y >= 0, Y =< 255 ->
+    Packet = chat_client_protocol:encode_teleport(X, Y),
+    send_packet({teleport, {X, Y}}, Packet, State);
+do_teleport(_X, _Y, State) ->
+    report_result(teleport, {error, invalid_position}, State).
+
+do_send_nearby(Content, State) ->
+    case normalize_text(Content) of
+        {ok, ContentBinary} ->
+            Packet = chat_client_protocol:encode_nearby_send(ContentBinary),
+            send_packet(send_nearby, Packet, State);
+        {error, Reason} ->
+            report_result(send_nearby, {error, Reason}, State)
+    end.
+
 send_packet(Action, Packet, #{socket := Socket} = State) ->
     case gen_tcp:send(Socket, Packet) of
         ok ->
@@ -167,16 +207,20 @@ handle_server_packet(Packet, State) ->
             handle_channel_push_batch(Messages, State);
         {ok, {channel_push, Message}} ->
             handle_channel_push(Message, State);
-        {ok, {private_push, _Message}} ->
-            State;
+        {ok, {private_push, Message}} ->
+            handle_private_push(Message, State);
+        {ok, {nearby_push, Message}} ->
+            handle_nearby_push(Message, State);
         {ok, Response} ->
             handle_response(Response, State);
         {error, Reason} ->
             handle_invalid_packet(Reason, State)
     end.
 
-handle_response({login_result, {ok, _RoleId, ChannelIds} = Result}, State) ->
-    LoggedInState = remember_channels(ChannelIds, State),
+handle_response({login_result,
+                 {ok, _RoleId, Position, ChannelIds} = Result}, State) ->
+    LoggedInState = remember_channels(
+        ChannelIds, State#{position := Position}),
     report_result(login, Result, start_mode_after_login(LoggedInState));
 handle_response({login_result, Result}, State) ->
     report_result(login, Result, State);
@@ -204,10 +248,23 @@ handle_response({channel_send_result, Result}, State) ->
     report_result(send_channel, Result, State);
 handle_response({private_send_result, Result}, State) ->
     report_result(send_private, Result, State);
+handle_response({move_result, {ok, Position} = Result}, State) ->
+    report_result(move, Result, State#{position := Position});
+handle_response({move_result, Result}, State) ->
+    report_result(move, Result, State);
+handle_response({teleport_result, {ok, Position} = Result}, State) ->
+    report_result(teleport, Result, State#{position := Position});
+handle_response({teleport_result, Result}, State) ->
+    report_result(teleport, Result, State);
+handle_response({nearby_send_result, Result}, State) ->
+    report_result(send_nearby, Result, State);
 handle_response({server_error, RequestProtoId, Reason}, State) ->
     report_result({server_error, RequestProtoId}, {error, Reason}, State).
 
 report_result(Action, Result, #{mode := observer} = State) ->
+    print_result(Action, Result),
+    State;
+report_result(Action, Result, #{feedback := true} = State) ->
     print_result(Action, Result),
     State;
 report_result(_Action, _Result, State) ->
@@ -218,7 +275,27 @@ handle_channel_push(Message,
                       observer_received := Received} = State) ->
     print_channel_push(Message),
     State#{observer_received := Received + 1};
+handle_channel_push(Message, #{feedback := true} = State) ->
+    print_channel_push(Message),
+    State;
 handle_channel_push(_Message, State) ->
+    State.
+
+handle_private_push(Message, #{feedback := true} = State) ->
+    print_private_push(Message),
+    State;
+handle_private_push(_Message, State) ->
+    State.
+
+handle_nearby_push(Message,
+                   #{mode := observer,
+                     observer_received := Received} = State) ->
+    print_nearby_push(Message),
+    State#{observer_received := Received + 1};
+handle_nearby_push(Message, #{feedback := true} = State) ->
+    print_nearby_push(Message),
+    State;
+handle_nearby_push(_Message, State) ->
     State.
 
 handle_channel_push_batch(Messages, State) ->
@@ -229,6 +306,9 @@ handle_invalid_packet(Reason,
                         observer_invalid := Invalid} = State) ->
     print_result(protocol, {error, Reason}),
     State#{observer_invalid := Invalid + 1};
+handle_invalid_packet(Reason, #{feedback := true} = State) ->
+    print_result(protocol, {error, Reason}),
+    State;
 handle_invalid_packet(_Reason, State) ->
     State.
 
@@ -330,3 +410,16 @@ print_channel_push(#{channel_id := ChannelId,
                      content := Content}) ->
     io:format("[channel ~p] ~ts(~p): ~ts~n",
               [ChannelId, SenderRoleName, SenderRoleId, Content]).
+
+print_private_push(#{sender_role_id := SenderRoleId,
+                     sender_role_name := SenderRoleName,
+                     content := Content}) ->
+    io:format("[private] ~ts(~p): ~ts~n",
+              [SenderRoleName, SenderRoleId, Content]).
+
+print_nearby_push(#{sender_role_id := SenderRoleId,
+                    sender_role_name := SenderRoleName,
+                    position := {X, Y},
+                    content := Content}) ->
+    io:format("[nearby ~p,~p] ~ts(~p): ~ts~n",
+              [X, Y, SenderRoleName, SenderRoleId, Content]).

@@ -3,7 +3,12 @@
 -export([start/2,
          start_observer/0,
          send_channel/3,
-         send_private/3]).
+         send_private/3,
+         move/2,
+         teleport/3,
+         send_nearby/2,
+         set_feedback/2,
+         position/1]).
 
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(DEFAULT_PORT, 5555).
@@ -59,6 +64,46 @@ send_private(SenderId, TargetId, Content)
 send_private(_SenderId, _TargetId, _Content) ->
     {error, invalid_client_id}.
 
+move(ClientId, Direction)
+  when is_integer(ClientId), ClientId > 0,
+       Direction =:= up orelse Direction =:= down orelse
+       Direction =:= left orelse Direction =:= right ->
+    send_client_command(ClientId, {move, Direction});
+move(ClientId, _Direction) when is_integer(ClientId), ClientId > 0 ->
+    {error, invalid_direction};
+move(_ClientId, _Direction) ->
+    {error, invalid_client_id}.
+
+teleport(ClientId, X, Y)
+  when is_integer(ClientId), ClientId > 0,
+       is_integer(X), X >= 0, X =< 255,
+       is_integer(Y), Y >= 0, Y =< 255 ->
+    send_client_command(ClientId, {teleport, X, Y});
+teleport(ClientId, _X, _Y) when is_integer(ClientId), ClientId > 0 ->
+    {error, invalid_position};
+teleport(_ClientId, _X, _Y) ->
+    {error, invalid_client_id}.
+
+send_nearby(ClientId, Content)
+  when is_integer(ClientId), ClientId > 0 ->
+    send_client_command(ClientId, {send_nearby, Content});
+send_nearby(_ClientId, _Content) ->
+    {error, invalid_client_id}.
+
+set_feedback(ClientId, Enabled)
+  when is_integer(ClientId), ClientId > 0, is_boolean(Enabled) ->
+    call_client(ClientId, {set_feedback, Enabled});
+set_feedback(ClientId, _Enabled)
+  when is_integer(ClientId), ClientId > 0 ->
+    {error, invalid_feedback};
+set_feedback(_ClientId, _Enabled) ->
+    {error, invalid_client_id}.
+
+position(ClientId) when is_integer(ClientId), ClientId > 0 ->
+    call_client(ClientId, position);
+position(_ClientId) ->
+    {error, invalid_client_id}.
+
 start_clients(ClientId, EndId, _Host, _Port, _ClientRange, Count)
   when ClientId > EndId ->
     {ok, Count};
@@ -104,6 +149,18 @@ send_client_command(ClientId, Command) ->
     case find_client(ClientId) of
         {ok, ClientPid} ->
             gen_server:cast(ClientPid, Command);
+        error ->
+            {error, {client_not_found, ClientId}}
+    end.
+
+call_client(ClientId, Request) ->
+    case find_client(ClientId) of
+        {ok, ClientPid} ->
+            try gen_server:call(ClientPid, Request) of
+                Reply -> Reply
+            catch
+                exit:_Reason -> {error, {client_not_found, ClientId}}
+            end;
         error ->
             {error, {client_not_found, ClientId}}
     end.

@@ -14,6 +14,8 @@ init([]) ->
     ChildSpecs = [
         #{id => role_online_server,
           start => {role_online_server, start_link, []}},
+        #{id => map_server,
+          start => {map_server, start_link, []}},
         channel_server:child_spec(1),
         #{id => channel_sup,
           start => {channel_sup, start_link, []},

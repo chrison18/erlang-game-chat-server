@@ -26,6 +26,7 @@ check(Port) ->
     check_login_errors(Port),
     check_protocol_errors(Port),
     check_world_member_shards(2),
+    BobRolePid = check_map_flow(Alice, AliceId, Bob, BobId),
     check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId),
     check_role_packet_batch(Alice, AliceId),
     check_world_batch_order(Alice, AliceId, Bob),
@@ -34,12 +35,14 @@ check(Port) ->
     gen_tcp:close(Bob),
     wait_until(fun() -> ets:info(online_roles, size) =:= 1 end),
     wait_until(fun() -> world_member_count() =:= 1 end),
+    check_map_cleanup(BobRolePid),
     check_world_member_shards(1),
     send(Alice, chat_client_protocol:encode_private_send(
         <<"bob">>, <<"after-close">>)),
     {private_send_result, {error, target_offline, <<"bob">>}} = recv(Alice),
     check_real_client(Port),
     check_main_restart(Alice),
+    check_map_restart(Port),
     check_restart_accepts_login(Port),
     ok.
 
@@ -67,11 +70,79 @@ check_protocol_errors(Port) ->
     Socket = connect(Port),
     send(Socket, chat_client_protocol:encode_channel_list()),
     {server_error, ?PROTO_CHANNEL_LIST_REQUEST, not_logged_in} = recv(Socket),
+    send(Socket, chat_client_protocol:encode_move(down)),
+    {server_error, ?PROTO_MAP_MOVE_REQUEST, not_logged_in} = recv(Socket),
+    send(Socket, <<?PROTO_MAP_TELEPORT_REQUEST:16, 1:8>>),
+    {server_error, ?PROTO_MAP_TELEPORT_REQUEST, invalid_packet} = recv(Socket),
     send(Socket, <<?PROTO_CHANNEL_JOIN_REQUEST:16, 1:8>>),
     {server_error, ?PROTO_CHANNEL_JOIN_REQUEST, invalid_packet} = recv(Socket),
     send(Socket, <<7777:16>>),
     {server_error, 7777, unknown_proto} = recv(Socket),
     gen_tcp:close(Socket).
+
+check_map_flow(Alice, AliceId, Bob, BobId) ->
+    AliceRolePid = role_pid(<<"alice">>),
+    BobRolePid = role_pid(<<"bob">>),
+    MapPid = whereis(map_server),
+    MapPid = ets:info(map_cells, owner),
+    MapPid = ets:info(map_role_positions, owner),
+    bag = ets:info(map_cells, type),
+    public = ets:info(map_cells, protection),
+    {ok, {0, 0}} = map_position(AliceRolePid),
+    {ok, {0, 0}} = map_position(BobRolePid),
+    2 = length(ets:lookup(map_cells, {0, 0})),
+
+    send(Alice, <<?PROTO_MAP_MOVE_REQUEST:16, 99:8>>),
+    {move_result, {error, invalid_direction, {0, 0}}} = recv(Alice),
+    send(Alice, chat_client_protocol:encode_move(up)),
+    {move_result, {error, out_of_bounds, {0, 0}}} = recv(Alice),
+    check_move(Alice, down, {1, 0}),
+    check_move(Alice, right, {1, 1}),
+    check_move(Alice, up, {0, 1}),
+    check_move(Alice, left, {0, 0}),
+    {ok, {0, 0}} = map_position(AliceRolePid),
+
+    send(Bob, chat_client_protocol:encode_teleport(99, 99)),
+    {teleport_result, {ok, {99, 99}}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_teleport(100, 0)),
+    {teleport_result, {error, invalid_position, {99, 99}}} = recv(Bob),
+    {ok, {99, 99}} = map_position(BobRolePid),
+
+    send(Alice, chat_client_protocol:encode_nearby_send(<<"corner">>)),
+    {nearby_send_result, {ok, 1}} = recv(Alice),
+    expect_nearby_push(Alice, AliceId, <<"alice">>, {0, 0}, <<"corner">>),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100),
+
+    send(Bob, chat_client_protocol:encode_teleport(1, 1)),
+    {teleport_result, {ok, {1, 1}}} = recv(Bob),
+    send(Alice, chat_client_protocol:encode_nearby_send(<<"near">>)),
+    {nearby_send_result, {ok, 2}} = recv(Alice),
+    expect_nearby_push(Alice, AliceId, <<"alice">>, {0, 0}, <<"near">>),
+    expect_nearby_push(Bob, AliceId, <<"alice">>, {0, 0}, <<"near">>),
+
+    send(Bob, chat_client_protocol:encode_teleport(2, 2)),
+    {teleport_result, {ok, {2, 2}}} = recv(Bob),
+    send(Alice, chat_client_protocol:encode_nearby_send(<<"far">>)),
+    {nearby_send_result, {ok, 1}} = recv(Alice),
+    expect_nearby_push(Alice, AliceId, <<"alice">>, {0, 0}, <<"far">>),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100),
+
+    send(Bob, chat_client_protocol:encode_teleport(0, 0)),
+    {teleport_result, {ok, {0, 0}}} = recv(Bob),
+    2 = length(ets:lookup(map_cells, {0, 0})),
+    true = BobId =/= AliceId,
+    BobRolePid.
+
+check_move(Socket, Direction, Position) ->
+    send(Socket, chat_client_protocol:encode_move(Direction)),
+    {move_result, {ok, Position}} = recv(Socket).
+
+check_map_cleanup(BobRolePid) ->
+    wait_until(fun() -> map_position(BobRolePid) =:= error end),
+    AliceRolePid = role_pid(<<"alice">>),
+    [AliceRolePid] = map_server:nearby({0, 0}),
+    [{{0, 0}, AliceRolePid}] = ets:lookup(map_cells, {0, 0}),
+    ok.
 
 check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId) ->
     send(Alice, chat_client_protocol:encode_channel_list()),
@@ -186,9 +257,35 @@ check_real_client(Port) ->
     {101, 101} = maps:get(client_range, State),
     ClientChannels = maps:get(channel_ids, State),
     check_initial_channels(ClientChannels),
+    false = maps:get(feedback, State),
+    {0, 0} = maps:get(position, State),
+    {ok, {0, 0}} = chat_load_test:position(101),
+    {error, invalid_feedback} = chat_load_test:set_feedback(101, loud),
+    ok = chat_load_test:set_feedback(101, true),
+    true = maps:get(feedback, sys:get_state(ClientPid)),
     false = lists:any(
         fun(Key) -> maps:is_key(Key, State) end,
         [status, role_id, password, action_state]),
+    ClientRolePid = role_pid(<<"client_101">>),
+    ok = chat_load_test:teleport(101, 100, 0),
+    ok = chat_load_test:move(101, down),
+    wait_until(fun() ->
+        map_position(ClientRolePid) =:= {ok, {1, 0}} andalso
+        chat_load_test:position(101) =:= {ok, {1, 0}}
+    end),
+    ok = chat_load_test:teleport(101, 1, 1),
+    wait_until(fun() ->
+        map_position(ClientRolePid) =:= {ok, {1, 1}} andalso
+        chat_load_test:position(101) =:= {ok, {1, 1}}
+    end),
+    ok = chat_load_test:set_feedback(101, false),
+    false = maps:get(feedback, sys:get_state(ClientPid)),
+    {error, invalid_direction} = chat_load_test:move(101, diagonal),
+    {error, invalid_position} = chat_load_test:teleport(101, -1, 0),
+    ok = chat_load_test:send_nearby(101, <<"manual-nearby">>),
+    expect_nearby_push(
+        Sink, role_id(<<"client_101">>), <<"client_101">>,
+        {1, 1}, <<"manual-nearby">>),
     {ok, ObserverPid} = chat_client_sup:start_client(
         batch_observer, "127.0.0.1", Port,
         <<"batch_observer">>, <<"123456">>, observer),
@@ -222,6 +319,7 @@ check_real_client(Port) ->
     wait_until(fun() -> ets:info(online_roles, size) =:= 1 end).
 
 check_main_restart(Alice) ->
+    OldMap = whereis(map_server),
     OldMain = whereis(main_channel_server),
     OldChannelSup = whereis(channel_sup),
     OldRoleSup = whereis(role_sup),
@@ -231,23 +329,48 @@ check_main_restart(Alice) ->
     wait_until(fun() -> changed(channel_sup, OldChannelSup) end),
     wait_until(fun() -> changed(role_sup, OldRoleSup) end),
     wait_until(fun() -> changed(chat_listener, OldListener) end),
+    OldMap = whereis(map_server),
     wait_socket_closed(Alice, 20),
     wait_until(fun() ->
         Snapshot = chat_metrics:snapshot(),
         maps:get(online_count, Snapshot) =:= 0 andalso
         maps:get(world_member_count, Snapshot) =:= 0 andalso
         maps:get(role_count, Snapshot) =:= 0 andalso
+        ets:info(map_role_positions, size) =:= 0 andalso
         maps:get(channel_count, Snapshot) =:= 10 andalso
         maps:get(world_worker_count, Snapshot) =:= 8
     end),
     check_world_member_shards(0).
 
+check_map_restart(Port) ->
+    {Socket, _RoleId, _Channels} = login(Port, <<"before_map_restart">>, <<"pw">>),
+    OldMap = whereis(map_server),
+    OldMain = whereis(main_channel_server),
+    OldChannelSup = whereis(channel_sup),
+    OldRoleSup = whereis(role_sup),
+    OldListener = whereis(chat_listener),
+    exit(OldMap, kill),
+    wait_until(fun() -> changed(map_server, OldMap) end),
+    wait_until(fun() -> changed(main_channel_server, OldMain) end),
+    wait_until(fun() -> changed(channel_sup, OldChannelSup) end),
+    wait_until(fun() -> changed(role_sup, OldRoleSup) end),
+    wait_until(fun() -> changed(chat_listener, OldListener) end),
+    wait_socket_closed(Socket, 20),
+    NewMap = whereis(map_server),
+    NewMap = ets:info(map_cells, owner),
+    NewMap = ets:info(map_role_positions, owner),
+    wait_until(fun() -> ets:info(online_roles, size) =:= 0 end),
+    0 = ets:info(map_role_positions, size),
+    check_world_member_shards(0).
+
 check_restart_accepts_login(Port) ->
     {Socket, _RoleId, _Channels} = login(Port, <<"after_restart">>, <<"pw">>),
     check_world_member_shards(1),
+    1 = ets:info(map_role_positions, size),
     gen_tcp:close(Socket),
     wait_until(fun() -> ets:info(online_roles, size) =:= 0 end),
-    wait_until(fun() -> world_member_count() =:= 0 end).
+    wait_until(fun() -> world_member_count() =:= 0 end),
+    wait_until(fun() -> ets:info(map_role_positions, size) =:= 0 end).
 
 check_world_member_shards(ExpectedCount) ->
     Tables = channel_server:world_member_tables(),
@@ -351,10 +474,41 @@ expect_push_content(Socket, SenderName, Content) ->
             expect_push_content(Socket, SenderName, Content)
     end.
 
+expect_nearby_push(Socket, SenderId, SenderName, Position, Content) ->
+    case recv(Socket) of
+        {nearby_push, #{sender_role_id := SenderId,
+                        sender_role_name := SenderName,
+                        position := Position,
+                        content := Content}} ->
+            ok;
+        _Other ->
+            expect_nearby_push(
+                Socket, SenderId, SenderName, Position, Content)
+    end.
+
+role_pid(RoleName) ->
+    [#online_role{role_pid = RolePid}] = ets:lookup(online_roles, RoleName),
+    RolePid.
+
+map_position(RolePid) ->
+    case ets:lookup(map_role_positions, RolePid) of
+        [{RolePid, Position}] -> {ok, Position};
+        [] -> error
+    end.
+
+role_id(RoleName) ->
+    RolePid = role_pid(RoleName),
+    [RoleId] = [Id
+                || Table <- channel_server:world_member_tables(),
+                   #world_channel_member{role_id = Id,
+                                         role_pid = MemberPid} <- ets:tab2list(Table),
+                   MemberPid =:= RolePid],
+    RoleId.
+
 login(Port, RoleName, Password) ->
     Socket = connect(Port),
     send(Socket, chat_client_protocol:encode_login(RoleName, Password)),
-    {login_result, {ok, RoleId, ChannelIds}} = recv(Socket),
+    {login_result, {ok, RoleId, {0, 0}, ChannelIds}} = recv(Socket),
     {Socket, RoleId, ChannelIds}.
 
 connect(Port) ->

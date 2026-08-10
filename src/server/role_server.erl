@@ -28,6 +28,11 @@ handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
     Packet = chat_server_protocol:encode_private_push(
         SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
+handle_cast({push_nearby, SenderRoleId, SenderRoleName, {X, Y}, Content},
+            #{socket := Socket} = State) ->
+    Packet = chat_server_protocol:encode_nearby_push(
+        SenderRoleId, SenderRoleName, X, Y, Content),
+    handle_push_send(Socket, Packet, State);
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -78,6 +83,15 @@ handle_packet(Packet, Socket) ->
             handle_authenticated_request(
                 ?PROTO_PRIVATE_SEND_REQUEST,
                 {send_private, TargetRoleName, Content}, Socket);
+        {ok, {move, Direction}} ->
+            handle_authenticated_request(
+                ?PROTO_MAP_MOVE_REQUEST, {move, Direction}, Socket);
+        {ok, {teleport, Position}} ->
+            handle_authenticated_request(
+                ?PROTO_MAP_TELEPORT_REQUEST, {teleport, Position}, Socket);
+        {ok, {send_nearby, Content}} ->
+            handle_authenticated_request(
+                ?PROTO_NEARBY_SEND_REQUEST, {send_nearby, Content}, Socket);
         {ok, {request, ProtoId, _Data}} ->
             case get(role_id) of
                 undefined -> send_packet(Socket,
@@ -150,7 +164,30 @@ handle_business_request({send_private, TargetRoleName, Content}, Socket,
             {error, target_offline, TargetRoleName}
     end,
     send_packet(Socket,
-        chat_server_protocol:encode_private_send_result(ProtocolResult)).
+        chat_server_protocol:encode_private_send_result(ProtocolResult));
+handle_business_request({move, Direction}, Socket, _RoleId) ->
+    Result = move(Direction, get(position)),
+    send_packet(Socket, chat_server_protocol:encode_move_result(Result));
+handle_business_request({teleport, Position}, Socket, _RoleId) ->
+    Result = teleport(Position, get(position)),
+    send_packet(Socket, chat_server_protocol:encode_teleport_result(Result));
+handle_business_request({send_nearby, Content}, Socket, RoleId) ->
+    Position = get(position),
+    Targets = map_server:nearby(Position),
+    lists:foreach(
+        fun(TargetPid) ->
+            gen_server:cast(TargetPid, {
+                push_nearby,
+                RoleId,
+                get(role_name),
+                Position,
+                Content
+            })
+        end,
+        Targets),
+    send_packet(Socket,
+        chat_server_protocol:encode_nearby_send_result(
+            {ok, length(Targets)})).
 
 joined_value(true) -> 1;
 joined_value(false) -> 0.
@@ -160,14 +197,17 @@ handle_login(Socket, RoleName, Password) ->
         undefined ->
             case role_online_server:login(self(), RoleName, Password) of
                 {ok, RoleId} ->
+                    InitialPosition = {0, 0},
+                    ok = map_server:enter(self(), InitialPosition),
                     ChannelIds = join_initial_channels(RoleId),
                     put(role_id, RoleId),
                     put(role_name, RoleName),
+                    put(position, InitialPosition),
                     put(channel_ids,
                         maps:from_list([{ChannelId, true} || ChannelId <- ChannelIds])),
                     send_packet(Socket,
                         chat_server_protocol:encode_login_result(
-                            {ok, RoleId, ChannelIds}));
+                            {ok, RoleId, InitialPosition, ChannelIds}));
                 {error, Reason} ->
                     send_packet(Socket,
                         chat_server_protocol:encode_login_result({error, Reason}))
@@ -222,6 +262,35 @@ send_private_message(TargetRoleName, SenderRoleId, SenderRoleName, Content) ->
         [] ->
             {error, target_offline}
     end.
+
+move(Direction, {X, Y} = Position) ->
+    Target = case Direction of
+        up -> {X - 1, Y};
+        down -> {X + 1, Y};
+        left -> {X, Y - 1};
+        right -> {X, Y + 1};
+        invalid -> invalid
+    end,
+    case Target of
+        invalid ->
+            {error, invalid_direction, Position};
+        _ ->
+            case map_server:valid_position(Target) of
+                true -> relocate(Position, Target);
+                false -> {error, out_of_bounds, Position}
+            end
+    end.
+
+teleport(Target, Position) ->
+    case map_server:valid_position(Target) of
+        true -> relocate(Position, Target);
+        false -> {error, invalid_position, Position}
+    end.
+
+relocate(OldPosition, NewPosition) ->
+    ok = map_server:relocate(self(), OldPosition, NewPosition),
+    put(position, NewPosition),
+    {ok, NewPosition}.
 
 handle_push_send(Socket, Packet, State) ->
     case send_packet(Socket, Packet) of

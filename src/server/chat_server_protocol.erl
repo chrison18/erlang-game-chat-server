@@ -12,6 +12,10 @@
          encode_channel_push_batch/1,
          encode_private_send_result/1,
          encode_private_push/3,
+         encode_move_result/1,
+         encode_teleport_result/1,
+         encode_nearby_send_result/1,
+         encode_nearby_push/5,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -50,6 +54,16 @@ decode_request(<<?PROTO_PRIVATE_SEND_REQUEST:16,
     end;
 decode_request(<<?PROTO_PRIVATE_SEND_REQUEST:16, _Data/binary>>) ->
     {error, {invalid_packet, ?PROTO_PRIVATE_SEND_REQUEST}};
+decode_request(<<?PROTO_MAP_MOVE_REQUEST:16, Direction:8>>) ->
+    {ok, {move, decode_direction(Direction)}};
+decode_request(<<?PROTO_MAP_MOVE_REQUEST:16, _Data/binary>>) ->
+    {error, {invalid_packet, ?PROTO_MAP_MOVE_REQUEST}};
+decode_request(<<?PROTO_MAP_TELEPORT_REQUEST:16, X:8, Y:8>>) ->
+    {ok, {teleport, {X, Y}}};
+decode_request(<<?PROTO_MAP_TELEPORT_REQUEST:16, _Data/binary>>) ->
+    {error, {invalid_packet, ?PROTO_MAP_TELEPORT_REQUEST}};
+decode_request(<<?PROTO_NEARBY_SEND_REQUEST:16, Content/binary>>) ->
+    {ok, {send_nearby, Content}};
 decode_request(<<ProtoId:16, Data/binary>>) ->
     case is_request_proto(ProtoId) of
         true -> {ok, {request, ProtoId, Data}};
@@ -58,11 +72,11 @@ decode_request(<<ProtoId:16, Data/binary>>) ->
 decode_request(_Packet) ->
     {error, {invalid_packet, 0}}.
 
-encode_login_result({ok, RoleId, ChannelIds}) ->
+encode_login_result({ok, RoleId, {X, Y}, ChannelIds}) ->
     ChannelCount = length(ChannelIds),
     ChannelData = << <<ChannelId:32>> || ChannelId <- ChannelIds >>,
     <<?PROTO_LOGIN_RESULT:16, ?RESULT_SUCCESS:8, RoleId:32,
-      ChannelCount:16, ChannelData/binary>>;
+      X:8, Y:8, ChannelCount:16, ChannelData/binary>>;
 encode_login_result({error, invalid_login}) ->
     <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_INVALID_LOGIN:8>>;
 encode_login_result({error, already_online}) ->
@@ -136,6 +150,29 @@ encode_private_push(SenderRoleId, SenderRoleName, Content) ->
     <<?PROTO_PRIVATE_PUSH:16, SenderRoleId:32,
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
 
+encode_move_result({ok, {X, Y}}) ->
+    <<?PROTO_MAP_MOVE_RESULT:16, ?RESULT_SUCCESS:8, X:8, Y:8>>;
+encode_move_result({error, invalid_direction, {X, Y}}) ->
+    <<?PROTO_MAP_MOVE_RESULT:16,
+      ?MAP_MOVE_RESULT_INVALID_DIRECTION:8, X:8, Y:8>>;
+encode_move_result({error, out_of_bounds, {X, Y}}) ->
+    <<?PROTO_MAP_MOVE_RESULT:16,
+      ?MAP_MOVE_RESULT_OUT_OF_BOUNDS:8, X:8, Y:8>>.
+
+encode_teleport_result({ok, {X, Y}}) ->
+    <<?PROTO_MAP_TELEPORT_RESULT:16, ?RESULT_SUCCESS:8, X:8, Y:8>>;
+encode_teleport_result({error, invalid_position, {X, Y}}) ->
+    <<?PROTO_MAP_TELEPORT_RESULT:16,
+      ?MAP_TELEPORT_RESULT_INVALID_POSITION:8, X:8, Y:8>>.
+
+encode_nearby_send_result({ok, TargetCount}) ->
+    <<?PROTO_NEARBY_SEND_RESULT:16, ?RESULT_SUCCESS:8, TargetCount:32>>.
+
+encode_nearby_push(SenderRoleId, SenderRoleName, X, Y, Content) ->
+    SenderNameLength = byte_size(SenderRoleName),
+    <<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
+      SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
+
 encode_private_send_result(ResultCode, TargetRoleName) ->
     TargetNameLength = byte_size(TargetRoleName),
     <<?PROTO_PRIVATE_SEND_RESULT:16, ResultCode:8,
@@ -153,4 +190,13 @@ is_request_proto(?PROTO_CHANNEL_JOIN_REQUEST) -> true;
 is_request_proto(?PROTO_CHANNEL_LEAVE_REQUEST) -> true;
 is_request_proto(?PROTO_CHANNEL_SEND_REQUEST) -> true;
 is_request_proto(?PROTO_PRIVATE_SEND_REQUEST) -> true;
+is_request_proto(?PROTO_MAP_MOVE_REQUEST) -> true;
+is_request_proto(?PROTO_MAP_TELEPORT_REQUEST) -> true;
+is_request_proto(?PROTO_NEARBY_SEND_REQUEST) -> true;
 is_request_proto(_ProtoId) -> false.
+
+decode_direction(?MAP_DIRECTION_UP) -> up;
+decode_direction(?MAP_DIRECTION_DOWN) -> down;
+decode_direction(?MAP_DIRECTION_LEFT) -> left;
+decode_direction(?MAP_DIRECTION_RIGHT) -> right;
+decode_direction(_Direction) -> invalid.

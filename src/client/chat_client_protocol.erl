@@ -8,6 +8,9 @@
          encode_channel_leave/1,
          encode_channel_send/2,
          encode_private_send/2,
+         encode_move/1,
+         encode_teleport/2,
+         encode_nearby_send/1,
          decode_packet/1]).
 
 encode_login(RoleName, Password) ->
@@ -32,11 +35,21 @@ encode_private_send(TargetRoleName, Content) ->
     <<?PROTO_PRIVATE_SEND_REQUEST:16, TargetNameLength:16,
       TargetRoleName/binary, Content/binary>>.
 
+encode_move(Direction) ->
+    <<?PROTO_MAP_MOVE_REQUEST:16, (direction_code(Direction)):8>>.
+
+encode_teleport(X, Y) ->
+    <<?PROTO_MAP_TELEPORT_REQUEST:16, X:8, Y:8>>.
+
+encode_nearby_send(Content) ->
+    <<?PROTO_NEARBY_SEND_REQUEST:16, Content/binary>>.
+
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?RESULT_SUCCESS:8,
-                RoleId:32, ChannelCount:16, ChannelData/binary>>)
+                RoleId:32, X:8, Y:8,
+                ChannelCount:16, ChannelData/binary>>)
   when byte_size(ChannelData) =:= ChannelCount * 4 ->
     ChannelIds = [ChannelId || <<ChannelId:32>> <= ChannelData],
-    {ok, {login_result, {ok, RoleId, ChannelIds}}};
+    {ok, {login_result, {ok, RoleId, {X, Y}, ChannelIds}}};
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_INVALID_LOGIN:8>>) ->
     {ok, {login_result, {error, invalid_login}}};
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_ALREADY_ONLINE:8>>) ->
@@ -107,6 +120,33 @@ decode_packet(<<?PROTO_PRIVATE_PUSH:16, SenderRoleId:32,
             {error, invalid_packet}
     end;
 decode_packet(<<?PROTO_PRIVATE_PUSH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+decode_packet(<<?PROTO_MAP_MOVE_RESULT:16, ResultCode:8, X:8, Y:8>>) ->
+    {ok, {move_result, decode_move_result(ResultCode, {X, Y})}};
+decode_packet(<<?PROTO_MAP_MOVE_RESULT:16, _Data/binary>>) ->
+    {error, invalid_packet};
+decode_packet(<<?PROTO_MAP_TELEPORT_RESULT:16, ResultCode:8, X:8, Y:8>>) ->
+    {ok, {teleport_result,
+          decode_teleport_result(ResultCode, {X, Y})}};
+decode_packet(<<?PROTO_MAP_TELEPORT_RESULT:16, _Data/binary>>) ->
+    {error, invalid_packet};
+decode_packet(<<?PROTO_NEARBY_SEND_RESULT:16,
+                ?RESULT_SUCCESS:8, TargetCount:32>>) ->
+    {ok, {nearby_send_result, {ok, TargetCount}}};
+decode_packet(<<?PROTO_NEARBY_SEND_RESULT:16, _Data/binary>>) ->
+    {error, invalid_packet};
+decode_packet(<<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
+                SenderNameLength:16, Data/binary>>) ->
+    case Data of
+        <<SenderRoleName:SenderNameLength/binary, Content/binary>> ->
+            {ok, {nearby_push, #{sender_role_id => SenderRoleId,
+                                 sender_role_name => SenderRoleName,
+                                 position => {X, Y},
+                                 content => Content}}};
+        _ ->
+            {error, invalid_packet}
+    end;
+decode_packet(<<?PROTO_NEARBY_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_ERROR:16, RequestProtoId:16, ErrorCode:8>>) ->
     {ok, {server_error, RequestProtoId, decode_error(ErrorCode)}};
@@ -203,3 +243,24 @@ decode_private_send_result(?PRIVATE_SEND_RESULT_TARGET_OFFLINE, TargetRoleName) 
     {error, target_offline, TargetRoleName};
 decode_private_send_result(ResultCode, TargetRoleName) ->
     {error, {unknown_result, ResultCode}, TargetRoleName}.
+
+decode_move_result(?RESULT_SUCCESS, Position) ->
+    {ok, Position};
+decode_move_result(?MAP_MOVE_RESULT_INVALID_DIRECTION, Position) ->
+    {error, invalid_direction, Position};
+decode_move_result(?MAP_MOVE_RESULT_OUT_OF_BOUNDS, Position) ->
+    {error, out_of_bounds, Position};
+decode_move_result(ResultCode, Position) ->
+    {error, {unknown_result, ResultCode}, Position}.
+
+decode_teleport_result(?RESULT_SUCCESS, Position) ->
+    {ok, Position};
+decode_teleport_result(?MAP_TELEPORT_RESULT_INVALID_POSITION, Position) ->
+    {error, invalid_position, Position};
+decode_teleport_result(ResultCode, Position) ->
+    {error, {unknown_result, ResultCode}, Position}.
+
+direction_code(up) -> ?MAP_DIRECTION_UP;
+direction_code(down) -> ?MAP_DIRECTION_DOWN;
+direction_code(left) -> ?MAP_DIRECTION_LEFT;
+direction_code(right) -> ?MAP_DIRECTION_RIGHT.
