@@ -1,21 +1,32 @@
 -module(chat_load_test).
 
 -export([start/2,
+         start_map/2,
          start_observer/0,
          send_channel/3,
          send_private/3,
          move/2,
          teleport/3,
          send_nearby/2,
+         join_map/2,
+         leave_map/1,
+         send_map/2,
          set_feedback/2,
-         position/1]).
+         position/1,
+         location/1]).
 
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(DEFAULT_PORT, 5555).
 -define(DEFAULT_PASSWORD, <<"123456">>).
 -define(OBSERVER_ROLE_NAME, <<"observer_001">>).
 
-start(StartId, EndId)
+start(StartId, EndId) ->
+    start(StartId, EndId, normal).
+
+start_map(StartId, EndId) ->
+    start(StartId, EndId, map_load).
+
+start(StartId, EndId, LoadMode)
   when is_integer(StartId), StartId > 0,
        is_integer(EndId), EndId >= StartId ->
     case existing_client(StartId, EndId) of
@@ -23,11 +34,11 @@ start(StartId, EndId)
             Host = application:get_env(chat, client_host, ?DEFAULT_HOST),
             Port = application:get_env(chat, port, ?DEFAULT_PORT),
             start_clients(StartId, EndId, Host, Port,
-                          {StartId, EndId}, 0);
+                          {LoadMode, StartId, EndId}, 0);
         ClientId ->
             {error, {client_already_started, ClientId}}
     end;
-start(_StartId, _EndId) ->
+start(_StartId, _EndId, _LoadMode) ->
     {error, invalid_client_range}.
 
 start_observer() ->
@@ -90,6 +101,25 @@ send_nearby(ClientId, Content)
 send_nearby(_ClientId, _Content) ->
     {error, invalid_client_id}.
 
+join_map(ClientId, MapId)
+  when is_integer(ClientId), ClientId > 0,
+       is_integer(MapId), MapId >= 0, MapId =< 16#FFFF ->
+    send_client_command(ClientId, {join_map, MapId});
+join_map(ClientId, _MapId) when is_integer(ClientId), ClientId > 0 ->
+    {error, invalid_map_id};
+join_map(_ClientId, _MapId) ->
+    {error, invalid_client_id}.
+
+leave_map(ClientId) when is_integer(ClientId), ClientId > 0 ->
+    send_client_command(ClientId, leave_map);
+leave_map(_ClientId) ->
+    {error, invalid_client_id}.
+
+send_map(ClientId, Content) when is_integer(ClientId), ClientId > 0 ->
+    send_client_command(ClientId, {send_map, Content});
+send_map(_ClientId, _Content) ->
+    {error, invalid_client_id}.
+
 set_feedback(ClientId, Enabled)
   when is_integer(ClientId), ClientId > 0, is_boolean(Enabled) ->
     call_client(ClientId, {set_feedback, Enabled});
@@ -104,21 +134,30 @@ position(ClientId) when is_integer(ClientId), ClientId > 0 ->
 position(_ClientId) ->
     {error, invalid_client_id}.
 
-start_clients(ClientId, EndId, _Host, _Port, _ClientRange, Count)
+location(ClientId) when is_integer(ClientId), ClientId > 0 ->
+    call_client(ClientId, location);
+location(_ClientId) ->
+    {error, invalid_client_id}.
+
+start_clients(ClientId, EndId, _Host, _Port, _LoadConfig, Count)
   when ClientId > EndId ->
     {ok, Count};
 start_clients(ClientId, EndId, Host, Port,
-              {StartId, EndId} = ClientRange, Count) ->
+              {LoadMode, StartId, EndId} = LoadConfig, Count) ->
+    ClientMode = case LoadMode of
+        normal -> {normal, ClientId, StartId, EndId};
+        map_load -> map_load
+    end,
     case chat_client_sup:start_client(
              ClientId,
              Host,
              Port,
              role_name(ClientId),
              ?DEFAULT_PASSWORD,
-             {normal, ClientId, StartId, EndId}) of
+             ClientMode) of
         {ok, _ClientPid} ->
             start_clients(ClientId + 1, EndId, Host, Port,
-                          ClientRange, Count + 1);
+                          LoadConfig, Count + 1);
         {error, Reason} ->
             {error, {client_start_failed, ClientId, Reason}}
     end.

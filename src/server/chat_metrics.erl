@@ -1,6 +1,8 @@
 -module(chat_metrics).
 
--export([snapshot/0]).
+-include("chat_record.hrl").
+
+-export([snapshot/0, online_clients/0, print_online_clients/0]).
 
 snapshot() ->
     {RoleCount, RoleQueueTotal, RoleQueueMax} =
@@ -27,6 +29,34 @@ snapshot() ->
       beam_process_count => erlang:system_info(process_count),
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
+
+online_clients() ->
+    lists:sort([
+        online_client(RoleName, RolePid)
+     || #online_role{role_name = RoleName, role_pid = RolePid} <-
+            ets:tab2list(online_roles)
+    ]).
+
+print_online_clients() ->
+    Clients = online_clients(),
+    lists:foreach(fun(Client) -> io:format("~p~n", [Client]) end, Clients),
+    {ok, length(Clients)}.
+
+online_client(RoleName, RolePid) ->
+    Dictionary = case process_info(RolePid, dictionary) of
+        {dictionary, Values} -> Values;
+        undefined -> []
+    end,
+    QueueLength = case process_info(RolePid, message_queue_len) of
+        {message_queue_len, Length} -> Length;
+        undefined -> undefined
+    end,
+    #{role_id => proplists:get_value(role_id, Dictionary),
+      role_name => RoleName,
+      role_pid => RolePid,
+      message_queue_len => QueueLength,
+      map_id => proplists:get_value(map_id, Dictionary),
+      position => proplists:get_value(position, Dictionary)}.
 
 child_pids(Supervisor, Module) ->
     try supervisor:which_children(Supervisor) of

@@ -5,6 +5,7 @@
 -include("chat_record.hrl").
 
 -export([child_spec/1,
+         map_child_spec/1,
          channels/0,
          channel/1,
          world_member_tables/0,
@@ -12,14 +13,24 @@
          start_link/2,
          join/3,
          leave/2,
-         send_channel/4]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+         send_channel/4,
+         join_map/3,
+         leave_map/2,
+         send_map/4]).
+-export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
+         handle_info/2]).
 
 child_spec(ChannelId) ->
     {ok, ChannelType, _ChannelName} = channel(ChannelId),
     #{id => {channel_server, ChannelId},
       start => {channel_server, start_link,
                 [ChannelId, ChannelType]}}.
+
+map_child_spec(MapId) ->
+    MapChannelId = {map, MapId},
+    #{id => {map_channel_server, MapId},
+      start => {channel_server, start_link,
+                [MapChannelId, ?CHANNEL_TYPE_PUBLIC]}}.
 
 channels() ->
     [channel_tuple(ChannelId) || ChannelId <- lists:seq(1, 10)].
@@ -57,8 +68,7 @@ start_link(ChannelId, Type) ->
 join(ChannelId, RoleId, RolePid) ->
     case channel(ChannelId) of
         {ok, _ChannelType, _ChannelName} ->
-            gen_server:call(
-                server_name(ChannelId), {join, RoleId, RolePid});
+            channel_call(ChannelId, {join, RoleId, RolePid});
         error ->
             {error, invalid_channel}
     end.
@@ -68,7 +78,7 @@ leave(1, _RoleId) ->
 leave(ChannelId, RoleId) ->
     case channel(ChannelId) of
         {ok, _ChannelType, _ChannelName} ->
-            gen_server:call(server_name(ChannelId), {leave, RoleId});
+            channel_call(ChannelId, {leave, RoleId});
         error ->
             {error, invalid_channel}
     end.
@@ -78,19 +88,43 @@ send_channel(1, RoleId, RoleName, Content) ->
 send_channel(ChannelId, RoleId, RoleName, Content) ->
     case channel(ChannelId) of
         {ok, ?CHANNEL_TYPE_PUBLIC, _ChannelName} ->
-            gen_server:call(
-                server_name(ChannelId),
-                {send_channel, RoleId, RoleName, Content});
+            channel_call(
+                ChannelId, {send_channel, RoleId, RoleName, Content});
         error ->
             {error, invalid_channel}
     end.
 
+join_map(MapId, RoleId, RolePid) ->
+    channel_call({map, MapId}, {join, RoleId, RolePid}).
+
+leave_map(MapId, RoleId) ->
+    channel_call({map, MapId}, {leave, RoleId}).
+
+send_map(MapId, RoleId, RoleName, Content) ->
+    channel_call(
+        {map, MapId}, {send_channel, RoleId, RoleName, Content}).
+
 init([ChannelId, Type]) ->
     ok = create_world_members(Type),
-    {ok, #channel_state{
+    State = #channel_state{
         channel_id = ChannelId,
         channel_type = Type
-    }}.
+    },
+    case Type of
+        ?CHANNEL_TYPE_MAIN ->
+            {ok, State};
+        ?CHANNEL_TYPE_PUBLIC ->
+            {ok, State, {continue, recover_members}}
+    end.
+
+handle_continue(recover_members,
+                #channel_state{channel_id = ChannelId} = State) ->
+    lists:foreach(
+        fun(#online_role{role_pid = RolePid}) ->
+            gen_server:cast(RolePid, {rejoin_channel, ChannelId})
+        end,
+        ets:tab2list(online_roles)),
+    {noreply, State}.
 
 handle_call({join, RoleId, RolePid}, _From,
             #channel_state{channel_id = ChannelId,
@@ -138,13 +172,8 @@ handle_call({send_channel, RoleId, RoleName, Content}, _From,
         true ->
             maps:foreach(
                 fun(_MemberRoleId, #channel_member{role_pid = MemberRolePid}) ->
-                    gen_server:cast(MemberRolePid, {
-                        push_channel,
-                        ChannelId,
-                        RoleId,
-                        RoleName,
-                        Content
-                    })
+                    push_message(MemberRolePid, ChannelId, RoleId,
+                                 RoleName, Content)
                 end,
                 Members
             ),
@@ -204,9 +233,33 @@ remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
 
+push_message(MemberRolePid, {map, MapId}, RoleId, RoleName, Content) ->
+    gen_server:cast(MemberRolePid, {
+        push_map,
+        MapId,
+        RoleId,
+        RoleName,
+        Content
+    });
+push_message(MemberRolePid, ChannelId, RoleId, RoleName, Content) ->
+    gen_server:cast(MemberRolePid, {
+        push_channel,
+        ChannelId,
+        RoleId,
+        RoleName,
+        Content
+    }).
+
 channel_tuple(ChannelId) ->
     {ok, ChannelType, ChannelName} = channel(ChannelId),
     {ChannelId, ChannelType, ChannelName}.
+
+channel_call(ChannelId, Request) ->
+    try gen_server:call(server_name(ChannelId), Request) of
+        Reply -> Reply
+    catch
+        exit:_Reason -> {error, channel_unavailable}
+    end.
 
 server_name(1) -> main_channel_server;
 server_name(2) -> public_channel_server_1;
@@ -217,4 +270,6 @@ server_name(6) -> public_channel_server_5;
 server_name(7) -> public_channel_server_6;
 server_name(8) -> public_channel_server_7;
 server_name(9) -> public_channel_server_8;
-server_name(10) -> public_channel_server_9.
+server_name(10) -> public_channel_server_9;
+server_name({map, 1}) -> map_channel_server_1;
+server_name({map, 2}) -> map_channel_server_2.

@@ -17,7 +17,10 @@ init([]) ->
     PublicChannels = [
         channel_server:child_spec(ChannelId)
      || ChannelId <- lists:seq(2, 10)],
-    {ok, {SupFlags, WorldWorkers ++ PublicChannels}}.
+    MapChannels = [
+        channel_server:map_child_spec(MapId)
+     || MapId <- map_server:map_ids()],
+    {ok, {SupFlags, WorldWorkers ++ PublicChannels ++ MapChannels}}.
 
 world_worker_child_spec(WorkerIndex) ->
     #{id => {world_broadcast_worker, WorkerIndex},

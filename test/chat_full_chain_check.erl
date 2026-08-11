@@ -27,7 +27,12 @@ check(Port) ->
     check_protocol_errors(Port),
     check_world_member_shards(2),
     BobRolePid = check_map_flow(Alice, AliceId, Bob, BobId),
+    check_multi_map_flow(Alice, AliceId, Bob, BobId),
+    check_map_channel_unavailable(Port, Alice, AliceId, Bob, BobId),
+    check_map_channel_recovery(Alice, AliceId, Bob, BobId),
     check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId),
+    check_public_channel_unavailable(Alice, AliceId, Bob, BobId),
+    check_public_channel_recovery(Alice, AliceId, Bob, BobId),
     check_role_packet_batch(Alice, AliceId),
     check_world_batch_order(Alice, AliceId, Bob),
     check_private_flow(Alice, AliceId, Bob, BobId),
@@ -72,6 +77,8 @@ check_protocol_errors(Port) ->
     {server_error, ?PROTO_CHANNEL_LIST_REQUEST, not_logged_in} = recv(Socket),
     send(Socket, chat_client_protocol:encode_move(down)),
     {server_error, ?PROTO_MAP_MOVE_REQUEST, not_logged_in} = recv(Socket),
+    send(Socket, chat_client_protocol:encode_map_join(2)),
+    {server_error, ?PROTO_MAP_JOIN_REQUEST, not_logged_in} = recv(Socket),
     send(Socket, <<?PROTO_MAP_TELEPORT_REQUEST:16, 1:8>>),
     {server_error, ?PROTO_MAP_TELEPORT_REQUEST, invalid_packet} = recv(Socket),
     send(Socket, <<?PROTO_CHANNEL_JOIN_REQUEST:16, 1:8>>),
@@ -87,10 +94,12 @@ check_map_flow(Alice, AliceId, Bob, BobId) ->
     MapPid = ets:info(map_cells, owner),
     MapPid = ets:info(map_role_positions, owner),
     bag = ets:info(map_cells, type),
-    public = ets:info(map_cells, protection),
+    protected = ets:info(map_cells, protection),
     {ok, {0, 0}} = map_position(AliceRolePid),
     {ok, {0, 0}} = map_position(BobRolePid),
-    2 = length(ets:lookup(map_cells, {0, 0})),
+    {ok, {1, {0, 0}}} = map_location(AliceRolePid),
+    {ok, {1, {0, 0}}} = map_location(BobRolePid),
+    2 = length(ets:lookup(map_cells, {1, 0, 0})),
 
     send(Alice, <<?PROTO_MAP_MOVE_REQUEST:16, 99:8>>),
     {move_result, {error, invalid_direction, {0, 0}}} = recv(Alice),
@@ -129,9 +138,129 @@ check_map_flow(Alice, AliceId, Bob, BobId) ->
 
     send(Bob, chat_client_protocol:encode_teleport(0, 0)),
     {teleport_result, {ok, {0, 0}}} = recv(Bob),
-    2 = length(ets:lookup(map_cells, {0, 0})),
+    2 = length(ets:lookup(map_cells, {1, 0, 0})),
     true = BobId =/= AliceId,
     BobRolePid.
+
+check_multi_map_flow(Alice, AliceId, Bob, BobId) ->
+    BobRolePid = role_pid(<<"bob">>),
+    send(Alice, chat_client_protocol:encode_map_join(99)),
+    {map_join_result, {error, invalid_map, 99}} = recv(Alice),
+    send(Alice, chat_client_protocol:encode_map_join(2)),
+    {map_join_result, {error, already_in_map, 1}} = recv(Alice),
+
+    send(Bob, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {ok, 1}} = recv(Bob),
+    {error, not_in_map} = map_server:location(BobRolePid),
+    send(Bob, chat_client_protocol:encode_move(down)),
+    {move_result, {error, not_in_map}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_teleport(1, 1)),
+    {teleport_result, {error, not_in_map}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_nearby_send(<<"outside">>)),
+    {nearby_send_result, {error, not_in_map}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_map_chat_send(<<"outside">>)),
+    {map_chat_send_result, {error, not_in_map}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {error, not_in_map}} = recv(Bob),
+
+    send(Bob, chat_client_protocol:encode_map_join(2)),
+    {map_join_result, {ok, 2, {0, 0}}} = recv(Bob),
+    {ok, {2, {0, 0}}} = map_location(BobRolePid),
+    1 = length(ets:lookup(map_role_positions, BobRolePid)),
+    send(Bob, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {error, already_in_map, 2}} = recv(Bob),
+
+    send(Alice, chat_client_protocol:encode_map_chat_send(<<"map-one">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    expect_map_chat_push(Alice, 1, AliceId, <<"alice">>, <<"map-one">>),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100),
+    send(Bob, chat_client_protocol:encode_map_chat_send(<<"map-two">>)),
+    {map_chat_send_result, {ok, 2}} = recv(Bob),
+    expect_map_chat_push(Bob, 2, BobId, <<"bob">>, <<"map-two">>),
+    {error, timeout} = gen_tcp:recv(Alice, 0, 100),
+
+    send(Alice, chat_client_protocol:encode_nearby_send(<<"map-isolated">>)),
+    {nearby_send_result, {ok, 1}} = recv(Alice),
+    expect_nearby_push(
+        Alice, AliceId, <<"alice">>, {0, 0}, <<"map-isolated">>),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100),
+
+    send(Bob, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {ok, 2}} = recv(Bob),
+    send(Bob, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {ok, 1, {0, 0}}} = recv(Bob),
+    send(Alice, chat_client_protocol:encode_map_chat_send(<<"together">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    expect_map_chat_push(Alice, 1, AliceId, <<"alice">>, <<"together">>),
+    expect_map_chat_push(Bob, 1, AliceId, <<"alice">>, <<"together">>),
+    {ok, {1, {0, 0}}} = map_location(BobRolePid).
+
+check_map_channel_unavailable(Port, Alice, AliceId, Bob, BobId) ->
+    MapPid = whereis(map_server),
+    AliceRolePid = role_pid(<<"alice">>),
+    BobRolePid = role_pid(<<"bob">>),
+    send(Bob, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {ok, 1}} = recv(Bob),
+    {error, not_in_map} = map_server:location(BobRolePid),
+
+    ChildId = {map_channel_server, 1},
+    ok = supervisor:terminate_child(channel_sup, ChildId),
+    undefined = whereis(map_channel_server_1),
+
+    send(Alice, chat_client_protocol:encode_map_chat_send(<<"unavailable">>)),
+    {map_chat_send_result, {error, map_unavailable, 1}} = recv(Alice),
+    send(Alice, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {error, map_unavailable, 1}} = recv(Alice),
+    {ok, {1, {0, 0}}} = map_server:location(AliceRolePid),
+    send(Bob, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {error, map_unavailable, 1}} = recv(Bob),
+    {error, not_in_map} = map_server:location(BobRolePid),
+
+    FailedLogin = connect(Port),
+    send(FailedLogin, chat_client_protocol:encode_login(
+        <<"map_unavailable_login">>, <<"pw">>)),
+    {login_result, {error, service_unavailable}} = recv(FailedLogin),
+    wait_socket_closed(FailedLogin, 20),
+    wait_until(fun() ->
+        ets:lookup(online_roles, <<"map_unavailable_login">>) =:= []
+    end),
+    MapPid = whereis(map_server),
+    2 = ets:info(online_roles, size),
+
+    {ok, _ChannelPid} = supervisor:restart_child(channel_sup, ChildId),
+    wait_until(fun() ->
+        case catch sys:get_state(map_channel_server_1) of
+            #channel_state{members = Members} ->
+                maps:is_key(AliceId, Members) andalso
+                not maps:is_key(BobId, Members);
+            _ ->
+                false
+        end
+    end),
+    send(Bob, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {ok, 1, {0, 0}}} = recv(Bob),
+    {ok, {1, {0, 0}}} = map_server:location(BobRolePid).
+
+check_map_channel_recovery(Alice, AliceId, Bob, BobId) ->
+    OldChannel = whereis(map_channel_server_1),
+    exit(OldChannel, kill),
+    wait_until(fun() -> changed(map_channel_server_1, OldChannel) end),
+    wait_until(fun() ->
+        case catch sys:get_state(map_channel_server_1) of
+            #channel_state{members = Members} ->
+                maps:is_key(AliceId, Members) andalso
+                maps:is_key(BobId, Members);
+            _ ->
+                false
+        end
+    end),
+    send(Alice, chat_client_protocol:encode_map_chat_send(
+        <<"map-after-restart">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    expect_map_chat_push(
+        Alice, 1, AliceId, <<"alice">>, <<"map-after-restart">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"map-after-restart">>).
 
 check_move(Socket, Direction, Position) ->
     send(Socket, chat_client_protocol:encode_move(Direction)),
@@ -140,8 +269,8 @@ check_move(Socket, Direction, Position) ->
 check_map_cleanup(BobRolePid) ->
     wait_until(fun() -> map_position(BobRolePid) =:= error end),
     AliceRolePid = role_pid(<<"alice">>),
-    [AliceRolePid] = map_server:nearby({0, 0}),
-    [{{0, 0}, AliceRolePid}] = ets:lookup(map_cells, {0, 0}),
+    {ok, [AliceRolePid]} = map_server:nearby({1, {0, 0}}),
+    [{{1, 0, 0}, AliceRolePid}] = ets:lookup(map_cells, {1, 0, 0}),
     ok.
 
 check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId) ->
@@ -185,6 +314,54 @@ check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId) ->
     expect_channel_push(Alice, 1, AliceId, <<"alice">>, <<"world">>),
     expect_channel_push(Bob, 1, AliceId, <<"alice">>, <<"world">>),
     true = BobId =/= AliceId.
+
+check_public_channel_unavailable(Alice, AliceId, Bob, BobId) ->
+    AliceRolePid = role_pid(<<"alice">>),
+    BobRolePid = role_pid(<<"bob">>),
+    ChildId = {channel_server, 2},
+    ok = supervisor:terminate_child(channel_sup, ChildId),
+    undefined = whereis(public_channel_server_1),
+
+    send(Alice, chat_client_protocol:encode_channel_send(
+        2, <<"unavailable">>)),
+    {channel_send_result, {error, channel_unavailable, 2}} = recv(Alice),
+    send(Alice, chat_client_protocol:encode_channel_leave(2)),
+    {channel_leave_result, {error, channel_unavailable, 2}} = recv(Alice),
+    send(Bob, chat_client_protocol:encode_channel_join(2)),
+    {channel_join_result, {error, channel_unavailable, 2}} = recv(Bob),
+    true = is_process_alive(AliceRolePid),
+    true = is_process_alive(BobRolePid),
+
+    {ok, _ChannelPid} = supervisor:restart_child(channel_sup, ChildId),
+    wait_until(fun() ->
+        case catch sys:get_state(public_channel_server_1) of
+            #channel_state{members = Members} ->
+                maps:is_key(AliceId, Members) andalso
+                not maps:is_key(BobId, Members);
+            _ ->
+                false
+        end
+    end).
+
+check_public_channel_recovery(Alice, AliceId, Bob, BobId) ->
+    OldChannel = whereis(public_channel_server_1),
+    exit(OldChannel, kill),
+    wait_until(fun() -> changed(public_channel_server_1, OldChannel) end),
+    wait_until(fun() ->
+        case catch sys:get_state(public_channel_server_1) of
+            #channel_state{members = Members} ->
+                maps:is_key(AliceId, Members) andalso
+                not maps:is_key(BobId, Members);
+            _ ->
+                false
+        end
+    end),
+    send(Alice, chat_client_protocol:encode_channel_send(
+        2, <<"public-after-restart">>)),
+    {channel_send_result, {ok, 2}} = recv(Alice),
+    expect_channel_push(
+        Alice, 2, AliceId, <<"alice">>, <<"public-after-restart">>),
+    {error, timeout} = gen_tcp:recv(Bob, 0, 100).
 
 check_private_flow(Alice, AliceId, Bob, _BobId) ->
     send(Alice, chat_client_protocol:encode_private_send(
@@ -250,22 +427,23 @@ check_real_client(Port) ->
     unlink(ClientSup),
     {ok, ClientPid} = chat_client_sup:start_client(
         101, "127.0.0.1", Port, <<"client_101">>, <<"123456">>,
-        {normal, 101, 101, 101}),
+        manual),
     wait_until(fun() -> ets:info(online_roles, size) =:= 3 end),
     State = sys:get_state(ClientPid),
-    101 = maps:get(client_id, State),
-    {101, 101} = maps:get(client_range, State),
+    manual = maps:get(mode, State),
     ClientChannels = maps:get(channel_ids, State),
     check_initial_channels(ClientChannels),
     false = maps:get(feedback, State),
+    1 = maps:get(map_id, State),
     {0, 0} = maps:get(position, State),
     {ok, {0, 0}} = chat_load_test:position(101),
+    {ok, {1, {0, 0}}} = chat_load_test:location(101),
     {error, invalid_feedback} = chat_load_test:set_feedback(101, loud),
     ok = chat_load_test:set_feedback(101, true),
     true = maps:get(feedback, sys:get_state(ClientPid)),
     false = lists:any(
         fun(Key) -> maps:is_key(Key, State) end,
-        [status, role_id, password, action_state]),
+        [status, role_id, password, action_state, client_id, client_range]),
     ClientRolePid = role_pid(<<"client_101">>),
     ok = chat_load_test:teleport(101, 100, 0),
     ok = chat_load_test:move(101, down),
@@ -286,6 +464,29 @@ check_real_client(Port) ->
     expect_nearby_push(
         Sink, role_id(<<"client_101">>), <<"client_101">>,
         {1, 1}, <<"manual-nearby">>),
+    ok = chat_load_test:send_map(101, <<"manual-map">>),
+    expect_map_chat_push(
+        Sink, 1, role_id(<<"client_101">>), <<"client_101">>,
+        <<"manual-map">>),
+    [ClientInfo] = [Info
+                    || Info <- chat_metrics:online_clients(),
+                       maps:get(role_name, Info) =:= <<"client_101">>],
+    1 = maps:get(map_id, ClientInfo),
+    {1, 1} = maps:get(position, ClientInfo),
+    ok = chat_load_test:leave_map(101),
+    wait_until(fun() ->
+        chat_load_test:location(101) =:= {error, not_in_map}
+    end),
+    ok = chat_load_test:join_map(101, 2),
+    wait_until(fun() ->
+        chat_load_test:location(101) =:= {ok, {2, {0, 0}}}
+    end),
+    ok = chat_load_test:leave_map(101),
+    ok = chat_load_test:join_map(101, 1),
+    wait_until(fun() ->
+        chat_load_test:location(101) =:= {ok, {1, {0, 0}}}
+    end),
+    check_map_load_client(),
     {ok, ObserverPid} = chat_client_sup:start_client(
         batch_observer, "127.0.0.1", Port,
         <<"batch_observer">>, <<"123456">>, observer),
@@ -310,13 +511,39 @@ check_real_client(Port) ->
     end),
     ok = gen_server:stop(ObserverPid),
     ok = chat_load_test:send_private(101, 999999, <<"offline">>),
+    {ok, AutoPid} = chat_client_sup:start_client(
+        103, "127.0.0.1", Port, <<"client_103">>, <<"123456">>,
+        {normal, 103, 103, 103}),
     wait_until(fun() ->
-        maps:get(action_seq, sys:get_state(ClientPid)) >= 2
+        maps:get(action_seq, sys:get_state(AutoPid)) >= 2
     end),
+    ok = gen_server:stop(AutoPid),
+    wait_until(fun() -> ets:info(online_roles, size) =:= 3 end),
     ok = gen_server:stop(ClientPid),
     gen_tcp:close(Sink),
     exit(ClientSup, shutdown),
     wait_until(fun() -> ets:info(online_roles, size) =:= 1 end).
+
+check_map_load_client() ->
+    {ok, 1} = chat_load_test:start_map(102, 102),
+    [ClientPid] = [Pid
+                   || {{chat_client, 102}, Pid, worker, _Modules} <-
+                          supervisor:which_children(chat_client_sup)],
+    wait_until(fun() ->
+        State = sys:get_state(ClientPid),
+        maps:get(load_started, State, false) andalso
+        map_server:valid_position(maps:get(position, State))
+    end),
+    {ok, Position} = chat_load_test:position(102),
+    {ok, {1, Position}} = chat_load_test:location(102),
+    {ok, Position} = map_position(role_pid(<<"client_102">>)),
+    {ok, {1, Position}} = map_location(role_pid(<<"client_102">>)),
+    ClientPid ! auto_action,
+    wait_until(fun() ->
+        maps:get(action_seq, sys:get_state(ClientPid)) >= 2
+    end),
+    ok = gen_server:stop(ClientPid),
+    wait_until(fun() -> ets:info(online_roles, size) =:= 3 end).
 
 check_main_restart(Alice) ->
     OldMap = whereis(map_server),
@@ -337,7 +564,7 @@ check_main_restart(Alice) ->
         maps:get(world_member_count, Snapshot) =:= 0 andalso
         maps:get(role_count, Snapshot) =:= 0 andalso
         ets:info(map_role_positions, size) =:= 0 andalso
-        maps:get(channel_count, Snapshot) =:= 10 andalso
+        maps:get(channel_count, Snapshot) =:= 12 andalso
         maps:get(world_worker_count, Snapshot) =:= 8
     end),
     check_world_member_shards(0).
@@ -486,13 +713,31 @@ expect_nearby_push(Socket, SenderId, SenderName, Position, Content) ->
                 Socket, SenderId, SenderName, Position, Content)
     end.
 
+expect_map_chat_push(Socket, MapId, SenderId, SenderName, Content) ->
+    case recv(Socket) of
+        {map_chat_push, #{map_id := MapId,
+                          sender_role_id := SenderId,
+                          sender_role_name := SenderName,
+                          content := Content}} ->
+            ok;
+        _Other ->
+            expect_map_chat_push(
+                Socket, MapId, SenderId, SenderName, Content)
+    end.
+
 role_pid(RoleName) ->
     [#online_role{role_pid = RolePid}] = ets:lookup(online_roles, RoleName),
     RolePid.
 
 map_position(RolePid) ->
+    case map_location(RolePid) of
+        {ok, {_MapId, Position}} -> {ok, Position};
+        error -> error
+    end.
+
+map_location(RolePid) ->
     case ets:lookup(map_role_positions, RolePid) of
-        [{RolePid, Position}] -> {ok, Position};
+        [{RolePid, Location}] -> {ok, Location};
         [] -> error
     end.
 

@@ -33,6 +33,14 @@ handle_cast({push_nearby, SenderRoleId, SenderRoleName, {X, Y}, Content},
     Packet = chat_server_protocol:encode_nearby_push(
         SenderRoleId, SenderRoleName, X, Y, Content),
     handle_push_send(Socket, Packet, State);
+handle_cast({push_map, MapId, SenderRoleId, SenderRoleName, Content},
+            #{socket := Socket} = State) ->
+    Packet = chat_server_protocol:encode_map_chat_push(
+        MapId, SenderRoleId, SenderRoleName, Content),
+    handle_push_send(Socket, Packet, State);
+handle_cast({rejoin_channel, ChannelId}, State) ->
+    maybe_rejoin_channel(ChannelId),
+    {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -47,6 +55,8 @@ handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
     case handle_packet(Packet, Socket) of
         ok ->
             {noreply, State};
+        stop ->
+            {stop, normal, State};
         {error, Reason} ->
             {stop, Reason, State}
     end;
@@ -92,6 +102,15 @@ handle_packet(Packet, Socket) ->
         {ok, {send_nearby, Content}} ->
             handle_authenticated_request(
                 ?PROTO_NEARBY_SEND_REQUEST, {send_nearby, Content}, Socket);
+        {ok, {join_map, MapId}} ->
+            handle_authenticated_request(
+                ?PROTO_MAP_JOIN_REQUEST, {join_map, MapId}, Socket);
+        {ok, leave_map} ->
+            handle_authenticated_request(
+                ?PROTO_MAP_LEAVE_REQUEST, leave_map, Socket);
+        {ok, {send_map, Content}} ->
+            handle_authenticated_request(
+                ?PROTO_MAP_CHAT_SEND_REQUEST, {send_map, Content}, Socket);
         {ok, {request, ProtoId, _Data}} ->
             case get(role_id) of
                 undefined -> send_packet(Socket,
@@ -166,28 +185,54 @@ handle_business_request({send_private, TargetRoleName, Content}, Socket,
     send_packet(Socket,
         chat_server_protocol:encode_private_send_result(ProtocolResult));
 handle_business_request({move, Direction}, Socket, _RoleId) ->
-    Result = move(Direction, get(position)),
+    Result = case get(map_id) of
+        undefined -> {error, not_in_map};
+        _MapId -> move(Direction, get(position))
+    end,
     send_packet(Socket, chat_server_protocol:encode_move_result(Result));
 handle_business_request({teleport, Position}, Socket, _RoleId) ->
-    Result = teleport(Position, get(position)),
+    Result = case get(map_id) of
+        undefined -> {error, not_in_map};
+        _MapId -> teleport(Position, get(position))
+    end,
     send_packet(Socket, chat_server_protocol:encode_teleport_result(Result));
 handle_business_request({send_nearby, Content}, Socket, RoleId) ->
-    Position = get(position),
-    Targets = map_server:nearby(Position),
-    lists:foreach(
-        fun(TargetPid) ->
-            gen_server:cast(TargetPid, {
-                push_nearby,
-                RoleId,
-                get(role_name),
-                Position,
-                Content
-            })
-        end,
-        Targets),
+    Result = send_nearby_message(RoleId, get(role_name), Content),
+    send_packet(Socket, chat_server_protocol:encode_nearby_send_result(Result));
+handle_business_request({join_map, MapId}, Socket, RoleId) ->
+    ProtocolResult = case map_server:join(
+                              RoleId, self(), MapId, {0, 0}) of
+        {ok, {MapId, Position}} ->
+            put(map_id, MapId),
+            put(position, Position),
+            {ok, MapId, Position};
+        {error, invalid_map} ->
+            {error, invalid_map, MapId};
+        {error, {already_in_map, CurrentMapId}} ->
+            {error, already_in_map, CurrentMapId};
+        {error, map_unavailable} ->
+            {error, map_unavailable, MapId}
+    end,
     send_packet(Socket,
-        chat_server_protocol:encode_nearby_send_result(
-            {ok, length(Targets)})).
+        chat_server_protocol:encode_map_join_result(ProtocolResult));
+handle_business_request(leave_map, Socket, RoleId) ->
+    ProtocolResult = case map_server:leave(RoleId, self()) of
+        {ok, _MapId} = Result ->
+            erase(map_id),
+            erase(position),
+            Result;
+        {error, not_in_map} = Error ->
+            Error;
+        {error, {map_unavailable, MapId}} ->
+            {error, map_unavailable, MapId}
+    end,
+    send_packet(Socket,
+        chat_server_protocol:encode_map_leave_result(ProtocolResult));
+handle_business_request({send_map, Content}, Socket, RoleId) ->
+    Result = send_map_message(
+        RoleId, get(role_name), get(map_id), Content),
+    send_packet(Socket,
+        chat_server_protocol:encode_map_chat_send_result(Result)).
 
 joined_value(true) -> 1;
 joined_value(false) -> 0.
@@ -197,17 +242,7 @@ handle_login(Socket, RoleName, Password) ->
         undefined ->
             case role_online_server:login(self(), RoleName, Password) of
                 {ok, RoleId} ->
-                    InitialPosition = {0, 0},
-                    ok = map_server:enter(self(), InitialPosition),
-                    ChannelIds = join_initial_channels(RoleId),
-                    put(role_id, RoleId),
-                    put(role_name, RoleName),
-                    put(position, InitialPosition),
-                    put(channel_ids,
-                        maps:from_list([{ChannelId, true} || ChannelId <- ChannelIds])),
-                    send_packet(Socket,
-                        chat_server_protocol:encode_login_result(
-                            {ok, RoleId, InitialPosition, ChannelIds}));
+                    complete_login(Socket, RoleId, RoleName);
                 {error, Reason} ->
                     send_packet(Socket,
                         chat_server_protocol:encode_login_result({error, Reason}))
@@ -218,6 +253,38 @@ handle_login(Socket, RoleName, Password) ->
                     {error, already_online}))
     end.
 
+complete_login(Socket, RoleId, RoleName) ->
+    InitialPosition = {0, 0},
+    InitialMapId = map_server:default_map_id(),
+    case map_server:join(
+             RoleId, self(), InitialMapId, InitialPosition) of
+        {ok, {InitialMapId, InitialPosition}} ->
+            case join_initial_channels(RoleId) of
+                {ok, ChannelIds} ->
+                    put(role_id, RoleId),
+                    put(role_name, RoleName),
+                    put(map_id, InitialMapId),
+                    put(position, InitialPosition),
+                    put(channel_ids, maps:from_list(
+                        [{ChannelId, true} || ChannelId <- ChannelIds])),
+                    send_packet(Socket,
+                        chat_server_protocol:encode_login_result(
+                            {ok, RoleId, InitialPosition, ChannelIds}));
+                {error, _Reason} ->
+                    reject_unavailable_login(Socket)
+            end;
+        {error, _Reason} ->
+            reject_unavailable_login(Socket)
+    end.
+
+reject_unavailable_login(Socket) ->
+    case send_packet(Socket,
+             chat_server_protocol:encode_login_result(
+                 {error, service_unavailable})) of
+        ok -> stop;
+        Error -> Error
+    end.
+
 join_initial_channels(RoleId) ->
     PublicCount = rand:uniform(3),
     RandomizedPublicIds = [
@@ -226,14 +293,35 @@ join_initial_channels(RoleId) ->
             lists:sort([{rand:uniform(), Id} || Id <- lists:seq(2, 10)])
     ],
     ChannelIds = [1 | lists:sublist(RandomizedPublicIds, PublicCount)],
-    lists:foreach(
-        fun(ChannelId) ->
-            {ok, ChannelId} =
-                channel_server:join(ChannelId, RoleId, self())
-        end,
-        ChannelIds
-    ),
-    ChannelIds.
+    case join_channels(ChannelIds, RoleId) of
+        ok -> {ok, ChannelIds};
+        Error -> Error
+    end.
+
+join_channels([], _RoleId) ->
+    ok;
+join_channels([ChannelId | Rest], RoleId) ->
+    case channel_server:join(ChannelId, RoleId, self()) of
+        {ok, ChannelId} -> join_channels(Rest, RoleId);
+        {error, _Reason} = Error -> Error
+    end.
+
+maybe_rejoin_channel({map, MapId}) ->
+    case get(map_id) of
+        MapId ->
+            _ = channel_server:join_map(MapId, get(role_id), self()),
+            ok;
+        _ ->
+            ok
+    end;
+maybe_rejoin_channel(ChannelId) ->
+    case get(channel_ids) of
+        #{ChannelId := true} ->
+            _ = channel_server:join(ChannelId, get(role_id), self()),
+            ok;
+        _ ->
+            ok
+    end.
 
 send_channel_message(ChannelId, RoleId, RoleName, Content) ->
     case channel_server:channel(ChannelId) of
@@ -263,6 +351,37 @@ send_private_message(TargetRoleName, SenderRoleId, SenderRoleName, Content) ->
             {error, target_offline}
     end.
 
+send_map_message(_RoleId, _RoleName, undefined, _Content) ->
+    {error, not_in_map};
+send_map_message(RoleId, RoleName, MapId, Content) ->
+    case channel_server:send_map(MapId, RoleId, RoleName, Content) of
+        {ok, {map, MapId}} -> {ok, MapId};
+        {error, not_joined} -> {error, not_in_map};
+        {error, channel_unavailable} ->
+            {error, map_unavailable, MapId}
+    end.
+
+send_nearby_message(RoleId, RoleName, Content) ->
+    case get(map_id) of
+        undefined ->
+            {error, not_in_map};
+        MapId ->
+            Position = get(position),
+            {ok, Targets} = map_server:nearby({MapId, Position}),
+            lists:foreach(
+                fun(TargetPid) ->
+                    gen_server:cast(TargetPid, {
+                        push_nearby,
+                        RoleId,
+                        RoleName,
+                        Position,
+                        Content
+                    })
+                end,
+                Targets),
+            {ok, length(Targets)}
+    end.
+
 move(Direction, {X, Y} = Position) ->
     Target = case Direction of
         up -> {X - 1, Y};
@@ -288,9 +407,17 @@ teleport(Target, Position) ->
     end.
 
 relocate(OldPosition, NewPosition) ->
-    ok = map_server:relocate(self(), OldPosition, NewPosition),
-    put(position, NewPosition),
-    {ok, NewPosition}.
+    case map_server:relocate(self(), NewPosition) of
+        {ok, NewPosition} ->
+            put(position, NewPosition),
+            {ok, NewPosition};
+        {error, not_in_map} ->
+            erase(map_id),
+            erase(position),
+            {error, not_in_map};
+        {error, invalid_position} ->
+            {error, invalid_position, OldPosition}
+    end.
 
 handle_push_send(Socket, Packet, State) ->
     case send_packet(Socket, Packet) of

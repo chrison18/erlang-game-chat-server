@@ -1,11 +1,13 @@
 -module(chat_client).
 -behaviour(gen_server).
 
+-include("chat_protocol.hrl").
+
 -export([start_link/5]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2]).
 
--define(AUTO_SEND_INTERVAL_MS, 3000).
+-define(AUTO_SEND_INTERVAL_MS, 1000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
 
 start_link(Host, Port, RoleName, Password, Mode) ->
@@ -18,6 +20,7 @@ init([Host, Port, RoleName, Password, Mode]) ->
         {ok, Socket} ->
             State = mode_state(Mode, #{socket => Socket,
                                        role_name => RoleName,
+                                       map_id => undefined,
                                        position => undefined,
                                        feedback => false,
                                        action_seq => 1,
@@ -30,9 +33,15 @@ init([Host, Port, RoleName, Password, Mode]) ->
     end.
 
 handle_call(position, _From, #{position := undefined} = State) ->
-    {reply, {error, not_logged_in}, State};
+    {reply, {error, not_in_map}, State};
 handle_call(position, _From, #{position := Position} = State) ->
     {reply, {ok, Position}, State};
+handle_call(location, _From,
+            #{map_id := undefined} = State) ->
+    {reply, {error, not_in_map}, State};
+handle_call(location, _From,
+            #{map_id := MapId, position := Position} = State) ->
+    {reply, {ok, {MapId, Position}}, State};
 handle_call({set_feedback, Enabled}, _From, State)
   when is_boolean(Enabled) ->
     {reply, ok, State#{feedback := Enabled}};
@@ -55,6 +64,12 @@ handle_cast({teleport, X, Y}, State) ->
     {noreply, do_teleport(X, Y, State)};
 handle_cast({send_nearby, Content}, State) ->
     {noreply, do_send_nearby(Content, State)};
+handle_cast({join_map, MapId}, State) ->
+    {noreply, do_join_map(MapId, State)};
+handle_cast(leave_map, State) ->
+    {noreply, do_leave_map(State)};
+handle_cast({send_map, Content}, State) ->
+    {noreply, do_send_map(Content, State)};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -67,6 +82,14 @@ handle_info(auto_action,
               action_seq := Sequence} = State) ->
     Content = auto_message(RoleName, Sequence),
     ActionState = do_auto_action(Content, State),
+    schedule_next_action(),
+    {noreply, ActionState#{action_seq := Sequence + 1}};
+handle_info(auto_action,
+            #{mode := map_load,
+              role_name := RoleName,
+              action_seq := Sequence} = State) ->
+    Content = auto_message(RoleName, Sequence),
+    ActionState = do_map_load_action(Content, State),
     schedule_next_action(),
     {noreply, ActionState#{action_seq := Sequence + 1}};
 handle_info(observer_report,
@@ -171,6 +194,25 @@ do_send_nearby(Content, State) ->
             report_result(send_nearby, {error, Reason}, State)
     end.
 
+do_join_map(MapId, State)
+  when is_integer(MapId), MapId >= 0, MapId =< 16#FFFF ->
+    Packet = chat_client_protocol:encode_map_join(MapId),
+    send_packet({join_map, MapId}, Packet, State);
+do_join_map(_MapId, State) ->
+    report_result(join_map, {error, invalid_map_id}, State).
+
+do_leave_map(State) ->
+    send_packet(leave_map, chat_client_protocol:encode_map_leave(), State).
+
+do_send_map(Content, State) ->
+    case normalize_text(Content) of
+        {ok, ContentBinary} ->
+            Packet = chat_client_protocol:encode_map_chat_send(ContentBinary),
+            send_packet(send_map, Packet, State);
+        {error, Reason} ->
+            report_result(send_map, {error, Reason}, State)
+    end.
+
 send_packet(Action, Packet, #{socket := Socket} = State) ->
     case gen_tcp:send(Socket, Packet) of
         ok ->
@@ -211,6 +253,8 @@ handle_server_packet(Packet, State) ->
             handle_private_push(Message, State);
         {ok, {nearby_push, Message}} ->
             handle_nearby_push(Message, State);
+        {ok, {map_chat_push, Message}} ->
+            handle_map_chat_push(Message, State);
         {ok, Response} ->
             handle_response(Response, State);
         {error, Reason} ->
@@ -220,7 +264,8 @@ handle_server_packet(Packet, State) ->
 handle_response({login_result,
                  {ok, _RoleId, Position, ChannelIds} = Result}, State) ->
     LoggedInState = remember_channels(
-        ChannelIds, State#{position := Position}),
+        ChannelIds, State#{map_id := ?DEFAULT_MAP_ID,
+                           position := Position}),
     report_result(login, Result, start_mode_after_login(LoggedInState));
 handle_response({login_result, Result}, State) ->
     report_result(login, Result, State);
@@ -252,12 +297,29 @@ handle_response({move_result, {ok, Position} = Result}, State) ->
     report_result(move, Result, State#{position := Position});
 handle_response({move_result, Result}, State) ->
     report_result(move, Result, State);
+handle_response({teleport_result, {ok, Position} = Result},
+                #{mode := map_load, load_started := false} = State) ->
+    schedule_next_action(),
+    report_result(teleport, Result,
+                  State#{position := Position, load_started := true});
 handle_response({teleport_result, {ok, Position} = Result}, State) ->
     report_result(teleport, Result, State#{position := Position});
 handle_response({teleport_result, Result}, State) ->
     report_result(teleport, Result, State);
 handle_response({nearby_send_result, Result}, State) ->
     report_result(send_nearby, Result, State);
+handle_response({map_join_result, {ok, MapId, Position} = Result}, State) ->
+    report_result(join_map, Result,
+                  State#{map_id := MapId, position := Position});
+handle_response({map_join_result, Result}, State) ->
+    report_result(join_map, Result, State);
+handle_response({map_leave_result, {ok, _MapId} = Result}, State) ->
+    report_result(leave_map, Result,
+                  State#{map_id := undefined, position := undefined});
+handle_response({map_leave_result, Result}, State) ->
+    report_result(leave_map, Result, State);
+handle_response({map_chat_send_result, Result}, State) ->
+    report_result(send_map, Result, State);
 handle_response({server_error, RequestProtoId, Reason}, State) ->
     report_result({server_error, RequestProtoId}, {error, Reason}, State).
 
@@ -298,6 +360,17 @@ handle_nearby_push(Message, #{feedback := true} = State) ->
 handle_nearby_push(_Message, State) ->
     State.
 
+handle_map_chat_push(Message,
+                     #{mode := observer,
+                       observer_received := Received} = State) ->
+    print_map_chat_push(Message),
+    State#{observer_received := Received + 1};
+handle_map_chat_push(Message, #{feedback := true} = State) ->
+    print_map_chat_push(Message),
+    State;
+handle_map_chat_push(_Message, State) ->
+    State.
+
 handle_channel_push_batch(Messages, State) ->
     lists:foldl(fun handle_channel_push/2, State, Messages).
 
@@ -318,6 +391,10 @@ start_mode_after_login(#{mode := observer} = State) ->
 start_mode_after_login(#{mode := normal} = State) ->
     schedule_next_action(),
     State;
+start_mode_after_login(#{mode := map_load} = State) ->
+    do_teleport(rand:uniform(?MAP_SIZE) - 1,
+                rand:uniform(?MAP_SIZE) - 1,
+                State);
 start_mode_after_login(State) ->
     State.
 
@@ -342,6 +419,13 @@ mode_state({normal, ClientId, StartId, EndId}, State) ->
            client_id => ClientId,
            client_range => {StartId, EndId},
            channel_ids => []};
+mode_state(map_load, State) ->
+    State#{mode => map_load,
+           channel_ids => [],
+           load_started => false};
+mode_state(manual, State) ->
+    State#{mode => manual,
+           channel_ids => []};
 mode_state(normal, State) ->
     State#{mode => normal,
            client_id => undefined,
@@ -354,11 +438,21 @@ remember_channels(_ChannelIds, State) ->
     State.
 
 do_auto_action(Content, State) ->
-    case rand:uniform(10) of
-        Roll when Roll =< 4 -> do_send_channel(1, Content, State);
-        Roll when Roll =< 8 -> auto_private(Content, State);
-        9 -> auto_join(Content, State);
-        10 -> auto_leave(Content, State)
+    case rand:uniform(7) of
+        1 -> do_send_channel(1, Content, State);
+        2 -> auto_private(Content, State);
+        3 -> do_move(random_direction(), State);
+        4 -> do_teleport(random_coordinate(), random_coordinate(), State);
+        5 -> do_send_nearby(Content, State);
+        6 -> do_send_map(Content, State);
+        7 -> auto_switch_map(State)
+    end.
+
+do_map_load_action(Content, State) ->
+    case rand:uniform(2) of
+        1 -> do_move(element(rand:uniform(4),
+                             {up, down, left, right}), State);
+        2 -> do_send_nearby(Content, State)
     end.
 
 auto_private(Content,
@@ -371,18 +465,17 @@ auto_private(Content,
 auto_private(Content, State) ->
     do_send_channel(1, Content, State).
 
-%% ponytail: at most 10 channels; use sets only if the channel count grows.
-auto_join(Content, #{channel_ids := ChannelIds} = State) ->
-    case random_member(lists:seq(2, 10) -- ChannelIds) of
-        none -> do_send_channel(1, Content, State);
-        ChannelId -> do_join_channel(ChannelId, State)
-    end.
+auto_switch_map(#{map_id := undefined} = State) ->
+    do_join_map(random_member(?MAP_IDS), State);
+auto_switch_map(#{map_id := MapId} = State) ->
+    TargetMapId = random_member(lists:delete(MapId, ?MAP_IDS)),
+    do_join_map(TargetMapId, do_leave_map(State)).
 
-auto_leave(Content, #{channel_ids := ChannelIds} = State) ->
-    case random_member(lists:delete(1, ChannelIds)) of
-        none -> do_send_channel(1, Content, State);
-        ChannelId -> do_leave_channel(ChannelId, State)
-    end.
+random_direction() ->
+    element(rand:uniform(4), {up, down, left, right}).
+
+random_coordinate() ->
+    rand:uniform(?MAP_SIZE) - 1.
 
 random_target(_ClientId, Id, Id) ->
     none;
@@ -423,3 +516,10 @@ print_nearby_push(#{sender_role_id := SenderRoleId,
                     content := Content}) ->
     io:format("[nearby ~p,~p] ~ts(~p): ~ts~n",
               [X, Y, SenderRoleName, SenderRoleId, Content]).
+
+print_map_chat_push(#{map_id := MapId,
+                      sender_role_id := SenderRoleId,
+                      sender_role_name := SenderRoleName,
+                      content := Content}) ->
+    io:format("[map ~p] ~ts(~p): ~ts~n",
+              [MapId, SenderRoleName, SenderRoleId, Content]).

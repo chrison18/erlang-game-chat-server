@@ -16,6 +16,10 @@
          encode_teleport_result/1,
          encode_nearby_send_result/1,
          encode_nearby_push/5,
+         encode_map_join_result/1,
+         encode_map_leave_result/1,
+         encode_map_chat_send_result/1,
+         encode_map_chat_push/4,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -64,6 +68,16 @@ decode_request(<<?PROTO_MAP_TELEPORT_REQUEST:16, _Data/binary>>) ->
     {error, {invalid_packet, ?PROTO_MAP_TELEPORT_REQUEST}};
 decode_request(<<?PROTO_NEARBY_SEND_REQUEST:16, Content/binary>>) ->
     {ok, {send_nearby, Content}};
+decode_request(<<?PROTO_MAP_JOIN_REQUEST:16, MapId:16>>) ->
+    {ok, {join_map, MapId}};
+decode_request(<<?PROTO_MAP_JOIN_REQUEST:16, _Data/binary>>) ->
+    {error, {invalid_packet, ?PROTO_MAP_JOIN_REQUEST}};
+decode_request(<<?PROTO_MAP_LEAVE_REQUEST:16>>) ->
+    {ok, leave_map};
+decode_request(<<?PROTO_MAP_LEAVE_REQUEST:16, _Data/binary>>) ->
+    {error, {invalid_packet, ?PROTO_MAP_LEAVE_REQUEST}};
+decode_request(<<?PROTO_MAP_CHAT_SEND_REQUEST:16, Content/binary>>) ->
+    {ok, {send_map, Content}};
 decode_request(<<ProtoId:16, Data/binary>>) ->
     case is_request_proto(ProtoId) of
         true -> {ok, {request, ProtoId, Data}};
@@ -80,7 +94,9 @@ encode_login_result({ok, RoleId, {X, Y}, ChannelIds}) ->
 encode_login_result({error, invalid_login}) ->
     <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_INVALID_LOGIN:8>>;
 encode_login_result({error, already_online}) ->
-    <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_ALREADY_ONLINE:8>>.
+    <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_ALREADY_ONLINE:8>>;
+encode_login_result({error, service_unavailable}) ->
+    <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_SERVICE_UNAVAILABLE:8>>.
 
 encode_channel_list_result(ChannelList) ->
     ChannelCount = length(ChannelList),
@@ -100,7 +116,10 @@ encode_channel_join_result({error, invalid_channel, ChannelId}) ->
       ?CHANNEL_JOIN_RESULT_INVALID_CHANNEL:8, ChannelId:32>>;
 encode_channel_join_result({error, already_joined, ChannelId}) ->
     <<?PROTO_CHANNEL_JOIN_RESULT:16,
-      ?CHANNEL_JOIN_RESULT_ALREADY_JOINED:8, ChannelId:32>>.
+      ?CHANNEL_JOIN_RESULT_ALREADY_JOINED:8, ChannelId:32>>;
+encode_channel_join_result({error, channel_unavailable, ChannelId}) ->
+    <<?PROTO_CHANNEL_JOIN_RESULT:16,
+      ?CHANNEL_JOIN_RESULT_UNAVAILABLE:8, ChannelId:32>>.
 
 encode_channel_leave_result({ok, ChannelId}) ->
     <<?PROTO_CHANNEL_LEAVE_RESULT:16, ?RESULT_SUCCESS:8, ChannelId:32>>;
@@ -112,7 +131,10 @@ encode_channel_leave_result({error, not_joined, ChannelId}) ->
       ?CHANNEL_LEAVE_RESULT_NOT_JOINED:8, ChannelId:32>>;
 encode_channel_leave_result({error, cannot_leave_main, ChannelId}) ->
     <<?PROTO_CHANNEL_LEAVE_RESULT:16,
-      ?CHANNEL_LEAVE_RESULT_CANNOT_LEAVE_MAIN:8, ChannelId:32>>.
+      ?CHANNEL_LEAVE_RESULT_CANNOT_LEAVE_MAIN:8, ChannelId:32>>;
+encode_channel_leave_result({error, channel_unavailable, ChannelId}) ->
+    <<?PROTO_CHANNEL_LEAVE_RESULT:16,
+      ?CHANNEL_LEAVE_RESULT_UNAVAILABLE:8, ChannelId:32>>.
 
 encode_channel_send_result({ok, ChannelId}) ->
     <<?PROTO_CHANNEL_SEND_RESULT:16, ?RESULT_SUCCESS:8, ChannelId:32>>;
@@ -124,7 +146,10 @@ encode_channel_send_result({error, not_joined, ChannelId}) ->
       ?CHANNEL_SEND_RESULT_NOT_JOINED:8, ChannelId:32>>;
 encode_channel_send_result({error, broadcast_failed, ChannelId}) ->
     <<?PROTO_CHANNEL_SEND_RESULT:16,
-      ?CHANNEL_SEND_RESULT_BROADCAST_FAILED:8, ChannelId:32>>.
+      ?CHANNEL_SEND_RESULT_BROADCAST_FAILED:8, ChannelId:32>>;
+encode_channel_send_result({error, channel_unavailable, ChannelId}) ->
+    <<?PROTO_CHANNEL_SEND_RESULT:16,
+      ?CHANNEL_SEND_RESULT_UNAVAILABLE:8, ChannelId:32>>.
 
 encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
     SenderNameLength = byte_size(SenderRoleName),
@@ -157,20 +182,61 @@ encode_move_result({error, invalid_direction, {X, Y}}) ->
       ?MAP_MOVE_RESULT_INVALID_DIRECTION:8, X:8, Y:8>>;
 encode_move_result({error, out_of_bounds, {X, Y}}) ->
     <<?PROTO_MAP_MOVE_RESULT:16,
-      ?MAP_MOVE_RESULT_OUT_OF_BOUNDS:8, X:8, Y:8>>.
+      ?MAP_MOVE_RESULT_OUT_OF_BOUNDS:8, X:8, Y:8>>;
+encode_move_result({error, not_in_map}) ->
+    <<?PROTO_MAP_MOVE_RESULT:16,
+      ?MAP_MOVE_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>.
 
 encode_teleport_result({ok, {X, Y}}) ->
     <<?PROTO_MAP_TELEPORT_RESULT:16, ?RESULT_SUCCESS:8, X:8, Y:8>>;
 encode_teleport_result({error, invalid_position, {X, Y}}) ->
     <<?PROTO_MAP_TELEPORT_RESULT:16,
-      ?MAP_TELEPORT_RESULT_INVALID_POSITION:8, X:8, Y:8>>.
+      ?MAP_TELEPORT_RESULT_INVALID_POSITION:8, X:8, Y:8>>;
+encode_teleport_result({error, not_in_map}) ->
+    <<?PROTO_MAP_TELEPORT_RESULT:16,
+      ?MAP_TELEPORT_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>.
 
 encode_nearby_send_result({ok, TargetCount}) ->
-    <<?PROTO_NEARBY_SEND_RESULT:16, ?RESULT_SUCCESS:8, TargetCount:32>>.
+    <<?PROTO_NEARBY_SEND_RESULT:16, ?RESULT_SUCCESS:8, TargetCount:32>>;
+encode_nearby_send_result({error, not_in_map}) ->
+    <<?PROTO_NEARBY_SEND_RESULT:16, ?NEARBY_SEND_RESULT_NOT_IN_MAP:8>>.
 
 encode_nearby_push(SenderRoleId, SenderRoleName, X, Y, Content) ->
     SenderNameLength = byte_size(SenderRoleName),
     <<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
+      SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
+
+encode_map_join_result({ok, MapId, {X, Y}}) ->
+    <<?PROTO_MAP_JOIN_RESULT:16, ?RESULT_SUCCESS:8, MapId:16, X:8, Y:8>>;
+encode_map_join_result({error, invalid_map, MapId}) ->
+    <<?PROTO_MAP_JOIN_RESULT:16, ?MAP_JOIN_RESULT_INVALID_MAP:8, MapId:16>>;
+encode_map_join_result({error, already_in_map, MapId}) ->
+    <<?PROTO_MAP_JOIN_RESULT:16,
+      ?MAP_JOIN_RESULT_ALREADY_IN_MAP:8, MapId:16>>;
+encode_map_join_result({error, map_unavailable, MapId}) ->
+    <<?PROTO_MAP_JOIN_RESULT:16,
+      ?MAP_JOIN_RESULT_UNAVAILABLE:8, MapId:16>>.
+
+encode_map_leave_result({ok, MapId}) ->
+    <<?PROTO_MAP_LEAVE_RESULT:16, ?RESULT_SUCCESS:8, MapId:16>>;
+encode_map_leave_result({error, not_in_map}) ->
+    <<?PROTO_MAP_LEAVE_RESULT:16, ?MAP_LEAVE_RESULT_NOT_IN_MAP:8, 0:16>>;
+encode_map_leave_result({error, map_unavailable, MapId}) ->
+    <<?PROTO_MAP_LEAVE_RESULT:16,
+      ?MAP_LEAVE_RESULT_UNAVAILABLE:8, MapId:16>>.
+
+encode_map_chat_send_result({ok, MapId}) ->
+    <<?PROTO_MAP_CHAT_SEND_RESULT:16, ?RESULT_SUCCESS:8, MapId:16>>;
+encode_map_chat_send_result({error, not_in_map}) ->
+    <<?PROTO_MAP_CHAT_SEND_RESULT:16,
+      ?MAP_CHAT_SEND_RESULT_NOT_IN_MAP:8, 0:16>>;
+encode_map_chat_send_result({error, map_unavailable, MapId}) ->
+    <<?PROTO_MAP_CHAT_SEND_RESULT:16,
+      ?MAP_CHAT_SEND_RESULT_UNAVAILABLE:8, MapId:16>>.
+
+encode_map_chat_push(MapId, SenderRoleId, SenderRoleName, Content) ->
+    SenderNameLength = byte_size(SenderRoleName),
+    <<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
 
 encode_private_send_result(ResultCode, TargetRoleName) ->
@@ -193,6 +259,9 @@ is_request_proto(?PROTO_PRIVATE_SEND_REQUEST) -> true;
 is_request_proto(?PROTO_MAP_MOVE_REQUEST) -> true;
 is_request_proto(?PROTO_MAP_TELEPORT_REQUEST) -> true;
 is_request_proto(?PROTO_NEARBY_SEND_REQUEST) -> true;
+is_request_proto(?PROTO_MAP_JOIN_REQUEST) -> true;
+is_request_proto(?PROTO_MAP_LEAVE_REQUEST) -> true;
+is_request_proto(?PROTO_MAP_CHAT_SEND_REQUEST) -> true;
 is_request_proto(_ProtoId) -> false.
 
 decode_direction(?MAP_DIRECTION_UP) -> up;
