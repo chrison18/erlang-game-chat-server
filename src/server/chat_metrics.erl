@@ -2,7 +2,8 @@
 
 -include("chat_record.hrl").
 
--export([snapshot/0, online_clients/0, print_online_clients/0]).
+-export([snapshot/0, online_clients/0, print_online_clients/0,
+         record_broadcast_delivery/4]).
 
 snapshot() ->
     {RoleCount, RoleQueueTotal, RoleQueueMax} =
@@ -10,8 +11,24 @@ snapshot() ->
     {ChannelCount, ChannelQueueTotal, ChannelQueueMax} =
         queue_stats(child_pids(chat_sup, channel_server) ++
                     child_pids(channel_sup, channel_server)),
+    {MapWorkerCount, MapWorkerQueueTotal, MapWorkerQueueMax} =
+        queue_stats(child_pids(map_worker_sup, map_worker)),
+    MapWorkerQueues = maps:from_list([
+        {MapId, process_queue_length(whereis(map_worker:server_name(MapId)))}
+     || MapId <- map_router:map_ids()]),
     {WorkerCount, WorkerQueueTotal, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
+    NearbyWorkers = child_pids(channel_sup, nearby_broadcast_worker),
+    {NearbyWorkerCount, NearbyQueueTotal, NearbyQueueMax} =
+        queue_stats(NearbyWorkers),
+    NearbyStats = nearby_stats(),
+    ChannelBatchStats = channel_batch_stats(),
+    {WorldFlushes, WorldRolePackets, WorldPayloadBytes} =
+        broadcast_delivery_stats(world),
+    {MapFlushes, MapRolePackets, MapPayloadBytes} =
+        broadcast_delivery_stats(map),
+    {NearbyDeliveryFlushes, NearbyRolePackets, NearbyPayloadBytes} =
+        broadcast_delivery_stats(nearby),
     #{node => node(),
       schedulers_online => erlang:system_info(schedulers_online),
       online_count => table_size(online_roles),
@@ -23,12 +40,49 @@ snapshot() ->
       channel_count => ChannelCount,
       channel_queue_total => ChannelQueueTotal,
       channel_queue_max => ChannelQueueMax,
+      map_router_count => process_count(chat_sup, map_router),
+      map_worker_count => MapWorkerCount,
+      map_worker_queue_total => MapWorkerQueueTotal,
+      map_worker_queue_max => MapWorkerQueueMax,
+      map_worker_queues => MapWorkerQueues,
       world_worker_count => WorkerCount,
       world_worker_queue_total => WorkerQueueTotal,
       world_worker_queue_max => WorkerQueueMax,
+      nearby_worker_count => NearbyWorkerCount,
+      nearby_worker_queue_total => NearbyQueueTotal,
+      nearby_worker_queue_max => NearbyQueueMax,
+      nearby_messages => maps:get(messages, NearbyStats),
+      nearby_targets => maps:get(targets, NearbyStats),
+      nearby_flushes => maps:get(flushes, NearbyStats),
+      nearby_batch_messages => maps:get(batch_messages, NearbyStats),
+      nearby_batch_max => maps:get(batch_max, NearbyStats),
+      channel_timer_flushes => maps:get(timer, ChannelBatchStats),
+      channel_full_flushes => maps:get(full, ChannelBatchStats),
+      channel_member_sends => maps:get(member_change, ChannelBatchStats),
+      channel_batch_messages => maps:get(messages, ChannelBatchStats),
+      channel_batch_max => maps:get(max, ChannelBatchStats),
+      world_batch_flushes => WorldFlushes,
+      world_role_packets => WorldRolePackets,
+      world_payload_bytes => WorldPayloadBytes,
+      map_batch_flushes => MapFlushes,
+      map_role_packets => MapRolePackets,
+      map_payload_bytes => MapPayloadBytes,
+      nearby_delivery_flushes => NearbyDeliveryFlushes,
+      nearby_role_packets => NearbyRolePackets,
+      nearby_payload_bytes => NearbyPayloadBytes,
+      map_operations => map_router:operation_stats(),
       beam_process_count => erlang:system_info(process_count),
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
+
+record_broadcast_delivery(Type, Flushes, RolePackets, PayloadBytes) ->
+    try ets:update_counter(
+            broadcast_delivery_metrics, Type,
+            [{2, Flushes}, {3, RolePackets}, {4, PayloadBytes}]) of
+        _ -> ok
+    catch
+        error:badarg -> ok
+    end.
 
 online_clients() ->
     lists:sort([
@@ -80,8 +134,66 @@ add_queue_length(Pid, {Count, Total, Max}) ->
             {Count, Total, Max}
     end.
 
+nearby_stats() ->
+    lists:foldl(
+        fun({_MapId, Messages, Targets, Flushes,
+             BatchMessages, BatchMax}, Acc) ->
+            Acc#{messages := maps:get(messages, Acc) + Messages,
+                 targets := maps:get(targets, Acc) + Targets,
+                 flushes := maps:get(flushes, Acc) + Flushes,
+                 batch_messages := maps:get(batch_messages, Acc) +
+                                   BatchMessages,
+                 batch_max := erlang:max(
+                     maps:get(batch_max, Acc), BatchMax)}
+        end,
+        #{messages => 0,
+          targets => 0,
+          flushes => 0,
+          batch_messages => 0,
+          batch_max => 0},
+        table_rows(nearby_batch_metrics)).
+
+channel_batch_stats() ->
+    lists:foldl(
+        fun({{_ChannelId, Reason}, Count, Messages, Max}, Acc) ->
+            Acc#{Reason := maps:get(Reason, Acc) + Count,
+                 messages := maps:get(messages, Acc) + Messages,
+                 max := erlang:max(maps:get(max, Acc), Max)}
+        end,
+        #{timer => 0, full => 0, member_change => 0,
+          messages => 0, max => 0},
+        table_rows(channel_batch_metrics)).
+
+broadcast_delivery_stats(Type) ->
+    case table_rows(broadcast_delivery_metrics) of
+        Rows ->
+            case lists:keyfind(Type, 1, Rows) of
+                {Type, Flushes, RolePackets, PayloadBytes} ->
+                    {Flushes, RolePackets, PayloadBytes};
+                false ->
+                    {0, 0, 0}
+            end
+    end.
+
 table_size(Table) ->
     case ets:info(Table, size) of
         undefined -> 0;
         Size -> Size
     end.
+
+table_rows(Table) ->
+    case ets:info(Table) of
+        undefined -> [];
+        _ -> ets:tab2list(Table)
+    end.
+
+process_count(Supervisor, Module) ->
+    length(child_pids(Supervisor, Module)).
+
+process_queue_length(Pid) when is_pid(Pid) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, Length} -> Length;
+        undefined -> undefined
+    end;
+process_queue_length(_Pid) ->
+    undefined.

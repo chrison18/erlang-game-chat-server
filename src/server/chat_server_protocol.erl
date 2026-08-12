@@ -16,10 +16,12 @@
          encode_teleport_result/1,
          encode_nearby_send_result/1,
          encode_nearby_push/5,
+         encode_nearby_push_batch/1,
          encode_map_join_result/1,
          encode_map_leave_result/1,
          encode_map_chat_send_result/1,
          encode_map_chat_push/4,
+         encode_map_chat_push_batch/1,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -157,10 +159,19 @@ encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
 
 encode_channel_push_batch(Packets) ->
+    encode_push_batch(?PROTO_CHANNEL_PUSH_BATCH, Packets).
+
+encode_nearby_push_batch(Packets) ->
+    encode_push_batch(?PROTO_NEARBY_PUSH_BATCH, Packets).
+
+encode_map_chat_push_batch(Packets) ->
+    encode_push_batch(?PROTO_MAP_CHAT_PUSH_BATCH, Packets).
+
+encode_push_batch(ProtoId, Packets) ->
     PacketData = [<<(byte_size(Packet)):32, Packet/binary>>
                   || Packet <- Packets],
     iolist_to_binary([
-        <<?PROTO_CHANNEL_PUSH_BATCH:16, (length(Packets)):16>>,
+        <<ProtoId:16, (length(Packets)):16>>,
         PacketData
     ]).
 
@@ -185,7 +196,10 @@ encode_move_result({error, out_of_bounds, {X, Y}}) ->
       ?MAP_MOVE_RESULT_OUT_OF_BOUNDS:8, X:8, Y:8>>;
 encode_move_result({error, not_in_map}) ->
     <<?PROTO_MAP_MOVE_RESULT:16,
-      ?MAP_MOVE_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>.
+      ?MAP_MOVE_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>;
+encode_move_result({error, map_unavailable, {X, Y}}) ->
+    <<?PROTO_MAP_MOVE_RESULT:16,
+      ?MAP_MOVE_RESULT_UNAVAILABLE:8, X:8, Y:8>>.
 
 encode_teleport_result({ok, {X, Y}}) ->
     <<?PROTO_MAP_TELEPORT_RESULT:16, ?RESULT_SUCCESS:8, X:8, Y:8>>;
@@ -194,7 +208,10 @@ encode_teleport_result({error, invalid_position, {X, Y}}) ->
       ?MAP_TELEPORT_RESULT_INVALID_POSITION:8, X:8, Y:8>>;
 encode_teleport_result({error, not_in_map}) ->
     <<?PROTO_MAP_TELEPORT_RESULT:16,
-      ?MAP_TELEPORT_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>.
+      ?MAP_TELEPORT_RESULT_NOT_IN_MAP:8, 0:8, 0:8>>;
+encode_teleport_result({error, map_unavailable, {X, Y}}) ->
+    <<?PROTO_MAP_TELEPORT_RESULT:16,
+      ?MAP_TELEPORT_RESULT_UNAVAILABLE:8, X:8, Y:8>>.
 
 encode_nearby_send_result({ok, TargetCount}) ->
     <<?PROTO_NEARBY_SEND_RESULT:16, ?RESULT_SUCCESS:8, TargetCount:32>>;

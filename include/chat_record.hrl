@@ -16,12 +16,18 @@
     channel_id,
     channel_type,
     members = #{},
-    member_monitors = #{}
+    member_monitors = #{},
+    packets = [],
+    batch_size = 0,
+    batch_generation = 0,
+    flush_ref = undefined
 }).
 
 -record(channel_member, {
     role_pid,
-    monitor_ref
+    monitor_ref,
+    batch_generation = 0,
+    batch_start = 0
 }).
 
 -record(world_channel_member, {

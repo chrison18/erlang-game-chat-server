@@ -98,7 +98,8 @@ decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16,
                 MessageCount:16, MessageData/binary>>) ->
-    decode_channel_push_batch(MessageCount, MessageData, []);
+    decode_push_batch(
+        channel_push_batch, channel_push, MessageCount, MessageData, []);
 decode_packet(<<?PROTO_CHANNEL_PUSH:16, ChannelId:32, SenderRoleId:32,
                 SenderNameLength:16, Data/binary>>) ->
     case Data of
@@ -165,6 +166,10 @@ decode_packet(<<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
     end;
 decode_packet(<<?PROTO_NEARBY_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
+decode_packet(<<?PROTO_NEARBY_PUSH_BATCH:16,
+                MessageCount:16, MessageData/binary>>) ->
+    decode_push_batch(
+        nearby_push_batch, nearby_push, MessageCount, MessageData, []);
 decode_packet(<<?PROTO_MAP_JOIN_RESULT:16, ?RESULT_SUCCESS:8,
                 MapId:16, X:8, Y:8>>) ->
     {ok, {map_join_result, {ok, MapId, {X, Y}}}};
@@ -195,6 +200,11 @@ decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
     end;
 decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
+decode_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16,
+                MessageCount:16, MessageData/binary>>) ->
+    decode_push_batch(
+        map_chat_push_batch, map_chat_push,
+        MessageCount, MessageData, []);
 decode_packet(<<?PROTO_ERROR:16, RequestProtoId:16, ErrorCode:8>>) ->
     {ok, {server_error, RequestProtoId, decode_error(ErrorCode)}};
 decode_packet(<<ProtoId:16, _Data/binary>>) ->
@@ -207,25 +217,25 @@ decode_error(?ERROR_INVALID_PACKET) -> invalid_packet;
 decode_error(?ERROR_UNKNOWN_PROTO) -> unknown_proto;
 decode_error(ErrorCode) -> {unknown_error, ErrorCode}.
 
-decode_channel_push_batch(0, <<>>, Messages) ->
-    {ok, {channel_push_batch, lists:reverse(Messages)}};
-decode_channel_push_batch(Count,
-                          <<PacketLength:32, Data/binary>>,
-                          Messages)
+decode_push_batch(BatchType, _MessageType, 0, <<>>, Messages) ->
+    {ok, {BatchType, lists:reverse(Messages)}};
+decode_push_batch(BatchType, MessageType, Count,
+                  <<PacketLength:32, Data/binary>>, Messages)
   when Count > 0 ->
     case Data of
         <<Packet:PacketLength/binary, RemainingData/binary>> ->
             case decode_packet(Packet) of
-                {ok, {channel_push, Message}} ->
-                    decode_channel_push_batch(
-                        Count - 1, RemainingData, [Message | Messages]);
+                {ok, {MessageType, Message}} ->
+                    decode_push_batch(
+                        BatchType, MessageType, Count - 1,
+                        RemainingData, [Message | Messages]);
                 _Error ->
                     {error, invalid_packet}
             end;
         _ ->
             {error, invalid_packet}
     end;
-decode_channel_push_batch(_Count, _Data, _Messages) ->
+decode_push_batch(_BatchType, _MessageType, _Count, _Data, _Messages) ->
     {error, invalid_packet}.
 
 decode_channels(0, <<>>, Acc) ->
@@ -305,6 +315,8 @@ decode_move_result(?MAP_MOVE_RESULT_OUT_OF_BOUNDS, Position) ->
     {error, out_of_bounds, Position};
 decode_move_result(?MAP_MOVE_RESULT_NOT_IN_MAP, _Position) ->
     {error, not_in_map};
+decode_move_result(?MAP_MOVE_RESULT_UNAVAILABLE, Position) ->
+    {error, map_unavailable, Position};
 decode_move_result(ResultCode, Position) ->
     {error, {unknown_result, ResultCode}, Position}.
 
@@ -314,6 +326,8 @@ decode_teleport_result(?MAP_TELEPORT_RESULT_INVALID_POSITION, Position) ->
     {error, invalid_position, Position};
 decode_teleport_result(?MAP_TELEPORT_RESULT_NOT_IN_MAP, _Position) ->
     {error, not_in_map};
+decode_teleport_result(?MAP_TELEPORT_RESULT_UNAVAILABLE, Position) ->
+    {error, map_unavailable, Position};
 decode_teleport_result(ResultCode, Position) ->
     {error, {unknown_result, ResultCode}, Position}.
 

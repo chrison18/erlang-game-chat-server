@@ -16,27 +16,12 @@ init([]) ->
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
-handle_cast({push_channel, ChannelId, SenderRoleId, SenderRoleName, Content},
-            #{socket := Socket} = State) ->
-    Packet = chat_server_protocol:encode_channel_push(
-        ChannelId, SenderRoleId, SenderRoleName, Content),
-    handle_push_send(Socket, Packet, State);
-handle_cast({push_channel_batch, Packet}, #{socket := Socket} = State) ->
+handle_cast({push_batch, Packet}, #{socket := Socket} = State) ->
     handle_push_send(Socket, Packet, State);
 handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
             #{socket := Socket} = State) ->
     Packet = chat_server_protocol:encode_private_push(
         SenderRoleId, SenderRoleName, Content),
-    handle_push_send(Socket, Packet, State);
-handle_cast({push_nearby, SenderRoleId, SenderRoleName, {X, Y}, Content},
-            #{socket := Socket} = State) ->
-    Packet = chat_server_protocol:encode_nearby_push(
-        SenderRoleId, SenderRoleName, X, Y, Content),
-    handle_push_send(Socket, Packet, State);
-handle_cast({push_map, MapId, SenderRoleId, SenderRoleName, Content},
-            #{socket := Socket} = State) ->
-    Packet = chat_server_protocol:encode_map_chat_push(
-        MapId, SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
 handle_cast({rejoin_channel, ChannelId}, State) ->
     maybe_rejoin_channel(ChannelId),
@@ -200,8 +185,9 @@ handle_business_request({send_nearby, Content}, Socket, RoleId) ->
     Result = send_nearby_message(RoleId, get(role_name), Content),
     send_packet(Socket, chat_server_protocol:encode_nearby_send_result(Result));
 handle_business_request({join_map, MapId}, Socket, RoleId) ->
-    ProtocolResult = case map_server:join(
-                              RoleId, self(), MapId, {0, 0}) of
+    SpawnPosition = map_router:random_position(),
+    ProtocolResult = case map_router:join(
+                              RoleId, self(), MapId, SpawnPosition) of
         {ok, {MapId, Position}} ->
             put(map_id, MapId),
             put(position, Position),
@@ -216,7 +202,7 @@ handle_business_request({join_map, MapId}, Socket, RoleId) ->
     send_packet(Socket,
         chat_server_protocol:encode_map_join_result(ProtocolResult));
 handle_business_request(leave_map, Socket, RoleId) ->
-    ProtocolResult = case map_server:leave(RoleId, self()) of
+    ProtocolResult = case map_router:leave(RoleId, self()) of
         {ok, _MapId} = Result ->
             erase(map_id),
             erase(position),
@@ -254,9 +240,9 @@ handle_login(Socket, RoleName, Password) ->
     end.
 
 complete_login(Socket, RoleId, RoleName) ->
-    InitialPosition = {0, 0},
-    InitialMapId = map_server:default_map_id(),
-    case map_server:join(
+    InitialPosition = map_router:random_position(),
+    InitialMapId = map_router:default_map_id(),
+    case map_router:join(
              RoleId, self(), InitialMapId, InitialPosition) of
         {ok, {InitialMapId, InitialPosition}} ->
             case join_initial_channels(RoleId) of
@@ -367,18 +353,12 @@ send_nearby_message(RoleId, RoleName, Content) ->
             {error, not_in_map};
         MapId ->
             Position = get(position),
-            {ok, Targets} = map_server:nearby({MapId, Position}),
-            lists:foreach(
-                fun(TargetPid) ->
-                    gen_server:cast(TargetPid, {
-                        push_nearby,
-                        RoleId,
-                        RoleName,
-                        Position,
-                        Content
-                    })
-                end,
-                Targets),
+            {ok, Targets} = map_router:nearby({MapId, Position}),
+            {X, Y} = Position,
+            Packet = chat_server_protocol:encode_nearby_push(
+                RoleId, RoleName, X, Y, Content),
+            ok = nearby_broadcast_worker:send(
+                MapId, Position, Packet, Targets),
             {ok, length(Targets)}
     end.
 
@@ -394,20 +374,20 @@ move(Direction, {X, Y} = Position) ->
         invalid ->
             {error, invalid_direction, Position};
         _ ->
-            case map_server:valid_position(Target) of
+            case map_router:valid_position(Target) of
                 true -> relocate(Position, Target);
                 false -> {error, out_of_bounds, Position}
             end
     end.
 
 teleport(Target, Position) ->
-    case map_server:valid_position(Target) of
+    case map_router:valid_position(Target) of
         true -> relocate(Position, Target);
         false -> {error, invalid_position, Position}
     end.
 
 relocate(OldPosition, NewPosition) ->
-    case map_server:relocate(self(), NewPosition) of
+    case map_router:relocate(self(), NewPosition) of
         {ok, NewPosition} ->
             put(position, NewPosition),
             {ok, NewPosition};
@@ -416,7 +396,9 @@ relocate(OldPosition, NewPosition) ->
             erase(position),
             {error, not_in_map};
         {error, invalid_position} ->
-            {error, invalid_position, OldPosition}
+            {error, invalid_position, OldPosition};
+        {error, map_unavailable} ->
+            {error, map_unavailable, OldPosition}
     end.
 
 handle_push_send(Socket, Packet, State) ->
