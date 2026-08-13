@@ -17,7 +17,8 @@ V1.3 在 V1.2 的单节点聊天服务上增加多地图、地图加入/退出�
 - 单地图归属、移动、传送、地图加入/退出和地图聊天。
 - 同一地图九宫格查询与周围聊天；边界自动裁剪。
 - 公共频道和地图频道重启后的成员恢复。
-- `main`、公共频道和地图频道按频道独立批量推送。
+- `main`、公共频道和地图频道按频道独立批量推送，世界和地图批包按收益压缩。
+- 每条连接由独立 Socket Writer 顺序发送响应和广播。
 - 真实 TCP 全链路检查、在线角色明细和七动作压力客户端。
 
 当前不实现动态地图、跨节点分布、AOI 进入/离开通知、消息持久化和应用层心跳。服务端 `packet_size` 保持不变，批量客户端启动失败也不自动回滚。
@@ -35,7 +36,7 @@ flowchart LR
     Router --> Workers[map_worker_1 / 2 / 3]
     Workers --> MapETS[(map_cells_1/2/3 / map_role_positions)]
     Role -->|nearby 直读| MapETS
-    Role --> NearbyWorkers[3 个 nearby_broadcast_worker]
+    Role --> NearbyWorkers[6 个 nearby_broadcast_worker]
     NearbyWorkers --> Role
 
     Role -->|成员 join / leave| Main[main_channel_server]
@@ -48,7 +49,10 @@ flowchart LR
     Role --> Public[9 个公共 channel_server]
     Role --> MapChannel[3 个地图 channel_server]
     Public --> Role
-    MapChannel --> Role
+    MapChannel --> MapBroadcast[每地图 8 个 map_broadcast_worker]
+    MapBroadcast --> Role
+    Role --> SocketWriter[每连接一个 socket_writer]
+    SocketWriter --> Client
 ```
 
 | 模块 | 主要职责 |
@@ -56,11 +60,13 @@ flowchart LR
 | `chat_listener` | 接受连接，为每条 Socket 启动一个 `role_server` |
 | `role_online_server` | 管理账号和当前在线角色 |
 | `role_server` | 保存连接身份、频道、地图和坐标，处理业务协议与 TCP 推送 |
-| `map_router` | 持有共享位置/格子 ETS，按 `MapId` 定位 Worker，不转发业务消息 |
+| `map_router` | 持有共享位置/格子 ETS，按 `MapId` 直接调用对应 Worker，不经 Router 进程邮箱 |
 | `map_worker` | 每张地图一个进程，并行处理该地图的加入、退出、移动和传送 |
-| `channel_server` | 管理公共/地图频道成员，并按 `120ms/256` 组批广播 |
+| `channel_server` | 管理公共/地图频道成员，并按 `150ms/256` 组批广播 |
 | `world_broadcast_worker` | 为 `main` 分片接收者、组批并广播 |
-| `nearby_broadcast_worker` | 每地图按来源格子组批周围聊天 |
+| `map_broadcast_worker` | 每地图 8 路维护成员分片并执行地图聊天 fan-out |
+| `nearby_broadcast_worker` | 每地图 2 路按来源格子组批周围聊天 |
+| `socket_writer` | 每连接顺序执行 TCP 发送，使 Role 不被广播发送阻塞 |
 | `chat_client` | 维护一个真实 TCP 客户端及其本地确认状态 |
 | `chat_load_test` | 批量启动客户端和提供 Shell 操作入口 |
 | `chat_metrics` | 汇总在线数、邮箱和 BEAM 资源 |
@@ -79,22 +85,24 @@ flowchart TD
     ChatSup --> Listener[chat_listener]
 
     ChannelSup --> Workers[8 个世界 Worker]
-    ChannelSup --> NearbyWorkers[3 个附近聊天 Worker]
+    ChannelSup --> NearbyWorkers[6 个附近聊天 Worker]
     ChannelSup --> Public[9 个公共频道]
     ChannelSup --> MapChannels[3 个地图频道]
+    ChannelSup --> MapBroadcastWorkers[24 个地图广播 Worker]
     MapWorkerSup --> MapWorkers[3 个地图 Worker]
     RoleSup --> Roles[动态 Role]
 ```
 
-`chat_sup` 的子进程顺序是状态依赖顺序。`map_router` 或 `main_channel_server` 崩溃时，`rest_for_one` 会重启下游频道、地图 Worker、Role 和监听器，避免存活连接继续使用重建后的空 ETS。单个 `map_worker` 崩溃时只重启该 Worker，并从共享位置 ETS 恢复本地图格子和 Role monitor。
+`chat_sup` 的子进程顺序是状态依赖顺序。`map_router` 或 `main_channel_server` 崩溃时，`rest_for_one` 会重启下游频道、地图 Worker、Role 和监听器，避免存活连接继续使用重建后的空 ETS。单个 `map_worker` 崩溃时只重启该 Worker，并从共享位置 ETS 恢复本地图格子和 Role monitor；移动与恢复共用该 Worker 的串行边界，避免位置表和格子表留下旧坐标。
 
 | 状态 | Owner | 结构与约束 |
 |---|---|---|
 | `role_accounts`、`online_roles` | `role_online_server` | 账号与在线 RolePid |
-| `map_cells_1/2/3` | `map_router` | 每地图一个 `bag`：`{MapId,X,Y} -> RolePid` |
+| `map_cells_1/2/3` | `map_router` | 每地图一个 `bag`：`{MapId,X,Y} -> {RolePid,Writer}` |
 | `map_role_positions` | `map_router` | `set`：`RolePid -> {MapId,{X,Y}}`，保证单地图归属 |
 | `main` 成员 | `main_channel_server` | RoleId 哈希到 8 张唯一成员 ETS |
-| 公共/地图频道成员 | 对应 `channel_server` | 进程 State 中的成员 Map 与 monitor |
+| 公共频道成员 | 对应 `channel_server` | 进程 State 中的成员 Map 与 monitor |
+| 地图频道成员 | 对应 `channel_server` / `map_broadcast_worker` | RoleId 哈希到每地图 8 张 ETS；Worker 保留本分片内存副本 |
 | 身份、频道、地图、坐标 | 对应 `role_server` | 只在当前连接进程中使用 |
 | 客户端确认状态 | 对应 `chat_client` | 只在服务端成功结果后更新 |
 
@@ -107,14 +115,14 @@ sequenceDiagram
     participant C as chat_client
     participant R as role_server
     participant O as role_online_server
-    participant M as map_router / map_worker_1
+    participant M as map_router / 对应 map_worker
     participant CH as channel_server
 
     C->>R: 1001 登录
     R->>O: 校验或创建账号
     O-->>R: RoleId
-    R->>M: 加入地图 1 的随机合法坐标
-    M->>CH: 加入地图 1 内部频道
+    R->>M: 随机加入地图 1/2/3 的随机合法坐标
+    M->>CH: 加入对应内部地图频道
     R->>CH: 加入 main 和随机 1~3 个公共频道
     alt 初始化全部成功
         R-->>C: 1002 success
@@ -124,7 +132,7 @@ sequenceDiagram
     end
 ```
 
-登录成功后，角色一定属于地图 `1`，并加入 `main` 和随机 1～3 个公共频道。
+登录成功后，角色属于随机选择的地图 `1`、`2` 或 `3`，并加入 `main` 和随机 1～3 个公共频道。
 
 ### 5.2 切换地图
 
@@ -157,11 +165,11 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     Send[role_server 收到发送请求] --> Kind{消息类型}
-    Kind -->|main| World[8 个 Worker 按 120ms / 256 条组批]
+    Kind -->|main| World[8 个 Worker 按 150ms / 256 条组批]
     World --> WorldPush[每个成员每批一次 2010]
-    Kind -->|公共频道| Public[频道内按 120ms / 256 条组批]
+    Kind -->|公共频道| Public[频道内按 150ms / 256 条组批]
     Public --> PublicPush[每个成员每批一次 2010]
-    Kind -->|地图聊天| MapChannel[当前地图频道独立组批]
+    Kind -->|地图聊天| MapChannel[当前地图频道组批并交给 8 个成员分片]
     MapChannel --> MapPush[每个成员每批一次 4015]
     Kind -->|周围聊天| Nearby[并发读取同地图九宫格 ETS]
     Nearby --> NearbyWorker[每地图按来源格子 80ms / 256 条组批]
@@ -171,6 +179,8 @@ flowchart TD
 ```
 
 地图频道是内部频道，客户端不能把它当作普通频道手工加入。地图聊天和周围聊天都由 `role_server` 使用自身 `MapId`，不信任客户端提供成员身份。
+
+地图频道进程按顺序向分片 Worker 投递广播和 leave。leave 先从频道逻辑成员与 ETS 删除，目标 Worker 再按 FIFO 处理此前广播、发送当前尾批并删除本地成员；因此地图写路径不等待历史 fan-out，同时保持离开前消息边界。Worker 重启从 ETS 恢复成员，频道 owner 标识会过滤旧频道遗留消息。
 
 ## 6. 频道不可用与恢复
 
@@ -218,7 +228,7 @@ chat_metrics:print_online_clients().
 - `normal` 登录后每 `1000ms` 在频道聊天、私聊、移动、传送、周围聊天、地图聊天和切图中等概率选择一个动作。
 - `start_map/2` 每 `1000ms` 按 50% 移动、50% 周围聊天执行定向地图负载。
 - 客户端没有首次随机错峰；Shell 命令返回 `ok` 只表示已投递给客户端进程。
-- `snapshot/0` 统计 Role、频道、三个地图 Worker、世界/附近 Worker 邮箱，以及地图操作和批量数据。
+- `snapshot/0` 统计 Role、Socket Writer、频道、三个地图 Worker、世界/地图/附近广播 Worker 邮箱，以及地图操作、逻辑/线上字节和发送失败。
 
 ## 9. 验证与历史容量结论
 
@@ -233,13 +243,12 @@ chat_metrics:print_online_clients().
 |---|---|
 | 七动作 100 / 300 / 500，每档 8 秒 | 通过；500 档约 61.68 MiB，采样邮箱峰值为 0 |
 | 七动作 4000 | 通过；到齐后稳定超过 60 秒，关键邮箱无持续积压 |
-| 七动作 5000（三地图 Worker） | 到齐后关键邮箱接近 0，作为通往 6000 的短时档位通过 |
-| 七动作 6000（三地图 Worker） | 未通过；到齐后约 20 秒 Role 邮箱增至 167 万，主动止损 |
+| 七动作 5000 / 6000（随机出生，优化中间版） | 分别稳定 120 / 60 秒，关键队列可回落 |
+| 七动作 7000（随机出生，优化中间版） | Role 邮箱持续积压，主动止损 |
+| 七动作 10000（当前 V1.3） | 10000 个真实 TCP 客户端全部到齐并持续活跃 120 秒，门禁通过 |
 | 旧 V1.2 每 3 秒聊天负载 10000 | 历史结果通过，但不能代表当前七动作容量 |
 
-随机出生后的 `80ms` world 基线中，5000 人稳定观察 120 秒、6000 人稳定观察 60 秒，关键邮箱均反复回零；7000 人 Role 总邮箱持续增至约 87 万后主动止损。world 调整为 `120ms` 后，7000 人 60 秒内 Role 总邮箱仍由约 2.3 万增至 29.6 万。当前继续把公共/地图频道调整为 `120ms`，nearby 保持 `80ms`，等待重新验证 7000。
-
-改造前机器和负载下的明显拐点约为 2800～3200 在线，2000 是当时更有余量的持续验证档位，不是生产容量承诺。服务端退出后的 `econnrefused` 是 OOM 的结果。
+正式门禁使用本机回环 TCP、每客户端每 `1000ms` 七选一动作。0～120 秒共 25 个稳态样本的在线数均为 10000；`world/map/nearby_send_failures` 和 `socket_send_pend_total/max` 全部为 0。Role 和地图队列存在可回落的明显脉冲，峰值分别为 8092 和 3880，120 秒样本仍为 5653 和 3151，不能表述为全程无积压。服务端内存后段约在 453～496 MiB 波动，末值 463 MiB，未持续失控；join/leave 最大延迟约 391/111ms。门禁通过后的 SIGTERM 清理产生大量 `closed/einval` 日志，不属于稳态发送失败。
 
 ## 10. 全频道批量推送
 
@@ -247,30 +256,32 @@ chat_metrics:print_online_clients().
 flowchart LR
     Message[单条频道消息] --> Encode[编码单条 push]
     Encode --> Buffer[当前频道独立 batch]
-    Buffer --> Gate{频道 120ms / nearby 80ms / 256 条}
+    Buffer --> Gate{频道 150ms / nearby 80ms / 256 条}
     Gate --> Batch[编码一个批量包]
-    Batch --> Members[遍历当前频道成员]
-    Members --> Role[每个 Role 一次 cast]
-    Role --> TCP[每个 Role 一次 gen_tcp:send]
+    Batch --> Compress[world/map 有收益时 zlib 压缩]
+    Compress --> Members[遍历当前成员分片]
+    Members --> Writer[每个成员的 Socket Writer]
+    Writer --> TCP[顺序 gen_tcp:send]
 ```
 
 当前实现：
 
 1. `main` 保留现有 8 Worker，不建立新的全局广播进程。
-2. 普通频道和地图频道在各自 `channel_server` 内独立维护 batch。
-3. 复用服务端批量封包、客户端长度校验和 Role 通用批量 TCP 发送路径。
-4. 地图聊天增加独立批量推送类型；周围聊天由每地图 Worker 按来源格子组批，私聊仍保持单条推送。
+2. 普通频道和地图频道在各自 `channel_server` 内独立维护 batch；地图 fan-out 使用每地图 8 个成员分片 Worker。
+3. 复用服务端批量封包、客户端长度校验和每连接 Socket Writer；world/map 批包仅在压缩后更小时发送压缩包。
+4. 地图聊天增加独立批量推送类型；周围聊天由每地图 2 个 Worker 按来源格子组批，私聊仍保持单条推送。
 5. join 记录当前批次偏移，leave 只向离开者发送其应收后缀；成员变化不再触发全员 flush。
 6. `chat_metrics:snapshot/0` 已补充三个地图 Worker、附近 Worker、地图操作和批量指标。
 
-该实现降低 Role mailbox 事件、重复编码和 TCP send 次数，但不会消除广播总业务字节的 O(N^2) 增长，也不保证即可稳定承载 6000 客户端。
+该实现降低 Role mailbox 事件、线上字节、重复编码和 TCP send 次数；当前七动作 10000 客户端 120 秒门禁已通过，但广播逻辑工作量仍随发送者数乘接收者数增长。
 
 ## 11. 当前限制
 
 - `{active,true}` 没有接收背压，过载时会把压力转移到进程邮箱。
-- 公共和地图频道批量化已减少 Role mailbox 事件与 TCP send 次数，但尚未重新验证容量上限。
-- 每张地图内部仍由一个 Worker 串行处理 join、leave 和 relocate；不同地图可以并行。nearby 使用 ETS 并发快照，移动瞬间允许短暂漏收或多收。
-- 共享地图 ETS 为内部公开表，以换取三个 Worker 并发写入；当前没有第三方 BEAM 代码隔离边界。
+- 10000/120 秒是本机回环 TCP 的当前门禁结果，不是跨机器或生产容量承诺。
+- 每张地图内部仍由一个 Worker 串行处理 join、leave 和 relocate；这样也避免 Worker 重启恢复与移动并发写双 ETS 留下旧格。不同地图可以并行，nearby 使用 ETS 并发快照，移动瞬间允许短暂漏收或多收。
+- 共享地图 ETS 为内部公开表，使不同地图的三个 Worker 可以并发写各自状态；当前没有第三方 BEAM 代码隔离边界。
 - 世界、公共和地图广播的总业务字节仍随发送者数乘接收者数增长。
-- 成功响应不承诺接收者已收到，内存中的未发送消息也不持久化。
+- 成功响应不承诺接收者已收到，内存中的未发送消息也不持久化；地图 leave 入队后分片 Worker 若立即崩溃，离开尾批可能丢失。
+- 10000 门禁仍观察到 Role/地图队列脉冲与偶发高尾延迟，后续只有更长稳态或更严格延迟目标才需要继续优化。
 - 没有应用层心跳；大批连接退出时可能产生大量 Supervisor/logger 日志。

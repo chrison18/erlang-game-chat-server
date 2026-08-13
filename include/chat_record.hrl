@@ -25,6 +25,8 @@
 
 -record(channel_member, {
     role_pid,
+    socket,
+    writer,
     monitor_ref,
     batch_generation = 0,
     batch_start = 0
@@ -32,7 +34,18 @@
 
 -record(world_channel_member, {
     role_id,
-    role_pid
+    role_pid,
+    socket,
+    writer
+}).
+
+-record(map_channel_member, {
+    role_id,
+    owner_pid,
+    role_pid,
+    writer,
+    batch_generation = 0,
+    batch_start = 0
 }).
 
 -endif.

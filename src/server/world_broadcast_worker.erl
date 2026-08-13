@@ -7,7 +7,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2, handle_info/2]).
 
 -define(WORLD_CHANNEL_ID, 1).
--define(BATCH_WINDOW_MS, 120).
+-define(BATCH_WINDOW_MS, 150).
 -define(BATCH_MAX_MESSAGES, 256).
 
 start_link(WorkerIndex) ->
@@ -99,14 +99,18 @@ broadcast(Packets, WorkerIndex) ->
     MemberTable = lists:nth(
         WorkerIndex, channel_server:world_member_tables()),
     RolePackets = ets:foldl(
-        fun(#world_channel_member{role_pid = RolePid}, Count) ->
-            gen_server:cast(RolePid, {push_batch, BatchPacket}),
+        fun(#world_channel_member{role_pid = RolePid,
+                                  writer = Writer}, Count) ->
+            ok = role_server:send_push(
+                RolePid, Writer, BatchPacket, world),
             Count + 1
         end,
         0,
         MemberTable),
+    {LogicalSize, WireSize} = chat_server_protocol:batch_sizes(BatchPacket),
     chat_metrics:record_broadcast_delivery(
-        world, 1, RolePackets, RolePackets * byte_size(BatchPacket)).
+        world, 1, RolePackets,
+        RolePackets * LogicalSize, RolePackets * WireSize).
 
 worker_name(1) -> world_broadcast_worker_1;
 worker_name(2) -> world_broadcast_worker_2;

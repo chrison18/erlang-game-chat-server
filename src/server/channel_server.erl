@@ -10,19 +10,23 @@
          channel/1,
          world_member_tables/0,
          world_member_table/1,
+         map_member_tables/1,
+         map_member_table/2,
          start_link/2,
          join/3,
+         join/4,
          leave/2,
          send_channel/4,
          join_map/3,
          join_map/4,
+         join_map/5,
          leave_map/2,
          leave_map/3,
          send_map/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2]).
 
--define(BATCH_WINDOW_MS, 120).
+-define(BATCH_WINDOW_MS, 150).
 -define(BATCH_MAX_MESSAGES, 256).
 -define(REQUEST_DEADLINE_MS, 4000).
 -define(CALL_TIMEOUT_MS, 4500).
@@ -56,6 +60,23 @@ world_member_table(RoleId) ->
     Tables = world_member_tables(),
     lists:nth(erlang:phash2(RoleId, length(Tables)) + 1, Tables).
 
+map_member_tables(1) -> [map_channel_members_1_1, map_channel_members_1_2,
+                         map_channel_members_1_3, map_channel_members_1_4,
+                         map_channel_members_1_5, map_channel_members_1_6,
+                         map_channel_members_1_7, map_channel_members_1_8];
+map_member_tables(2) -> [map_channel_members_2_1, map_channel_members_2_2,
+                         map_channel_members_2_3, map_channel_members_2_4,
+                         map_channel_members_2_5, map_channel_members_2_6,
+                         map_channel_members_2_7, map_channel_members_2_8];
+map_member_tables(3) -> [map_channel_members_3_1, map_channel_members_3_2,
+                         map_channel_members_3_3, map_channel_members_3_4,
+                         map_channel_members_3_5, map_channel_members_3_6,
+                         map_channel_members_3_7, map_channel_members_3_8].
+
+map_member_table(MapId, RoleId) ->
+    Tables = map_member_tables(MapId),
+    lists:nth(erlang:phash2(RoleId, length(Tables)) + 1, Tables).
+
 channel(1) -> {ok, ?CHANNEL_TYPE_MAIN, <<"main">>};
 channel(2) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_1">>};
 channel(3) -> {ok, ?CHANNEL_TYPE_PUBLIC, <<"public_2">>};
@@ -73,9 +94,12 @@ start_link(ChannelId, Type) ->
         {local, server_name(ChannelId)}, ?MODULE, [ChannelId, Type], []).
 
 join(ChannelId, RoleId, RolePid) ->
+    join(ChannelId, RoleId, RolePid, undefined).
+
+join(ChannelId, RoleId, RolePid, Socket) ->
     case channel(ChannelId) of
         {ok, _ChannelType, _ChannelName} ->
-            channel_call(ChannelId, {join, RoleId, RolePid});
+            channel_call(ChannelId, {join, RoleId, RolePid, Socket});
         error ->
             {error, invalid_channel}
     end.
@@ -102,10 +126,17 @@ send_channel(ChannelId, RoleId, RoleName, Content) ->
     end.
 
 join_map(MapId, RoleId, RolePid) ->
-    channel_call({map, MapId}, {join, RoleId, RolePid}).
+    join_map(MapId, RoleId, RolePid, undefined).
 
-join_map(MapId, RoleId, RolePid, Deadline) ->
-    channel_call({map, MapId}, {join, RoleId, RolePid}, Deadline).
+join_map(MapId, RoleId, RolePid, Deadline) when is_integer(Deadline) ->
+    channel_call(
+        {map, MapId}, {join, RoleId, RolePid, undefined}, Deadline);
+join_map(MapId, RoleId, RolePid, Socket) ->
+    channel_call({map, MapId}, {join, RoleId, RolePid, Socket}).
+
+join_map(MapId, RoleId, RolePid, Socket, Deadline) ->
+    channel_call(
+        {map, MapId}, {join, RoleId, RolePid, Socket}, Deadline).
 
 leave_map(MapId, RoleId) ->
     channel_call({map, MapId}, {leave, RoleId}).
@@ -119,6 +150,7 @@ send_map(MapId, RoleId, RoleName, Content) ->
 
 init([ChannelId, Type]) ->
     ok = create_world_members(Type),
+    ok = create_map_members(ChannelId),
     State = #channel_state{
         channel_id = ChannelId,
         channel_type = Type
@@ -143,10 +175,10 @@ handle_continue(flush_batch, State) ->
 
 handle_call({channel_request, Deadline, Request}, From, State) ->
     case erlang:monotonic_time(millisecond) < Deadline of
-        true -> handle_call(Request, From, State);
+        true -> handle_call(with_deadline(Request, Deadline), From, State);
         false -> {reply, {error, channel_unavailable}, State}
     end;
-handle_call({join, RoleId, RolePid}, _From,
+handle_call({join, RoleId, RolePid, Connection}, _From,
             #channel_state{channel_id = ChannelId,
                            channel_type = ChannelType,
                            members = Members,
@@ -157,21 +189,30 @@ handle_call({join, RoleId, RolePid}, _From,
         true ->
             {reply, {error, already_joined}, State};
         false ->
-            MonitorRef = erlang:monitor(process, RolePid),
+            {Socket, Writer} = connection_parts(Connection),
             Member = #channel_member{
                 role_pid = RolePid,
-                monitor_ref = MonitorRef,
+                socket = Socket,
+                writer = Writer,
                 batch_generation = BatchGeneration,
                 batch_start = BatchSize
             },
-            ok = add_world_member(ChannelType, RoleId, RolePid),
-            {reply, {ok, ChannelId},
-             State#channel_state{
-                 members = Members#{RoleId => Member},
-                 member_monitors = MemberMonitors#{MonitorRef => RoleId}
-             }}
+            case add_map_member(ChannelId, RoleId, Member) of
+                ok ->
+                    MonitorRef = erlang:monitor(process, RolePid),
+                    MonitoredMember = Member#channel_member{monitor_ref = MonitorRef},
+                    ok = add_world_member(
+                        ChannelType, RoleId, RolePid, Socket, Writer),
+                    {reply, {ok, ChannelId},
+                     State#channel_state{
+                         members = Members#{RoleId => MonitoredMember},
+                         member_monitors = MemberMonitors#{MonitorRef => RoleId}
+                     }};
+                {error, channel_unavailable} ->
+                    {reply, {error, channel_unavailable}, State}
+            end
     end;
-handle_call({leave, RoleId}, _From,
+handle_call({leave, RoleId, Deadline}, _From,
             #channel_state{channel_id = ChannelId,
                            channel_type = ChannelType,
                            members = Members,
@@ -179,14 +220,19 @@ handle_call({leave, RoleId}, _From,
     case maps:take(RoleId, Members) of
         {#channel_member{monitor_ref = MonitorRef} = Member,
          RemainingMembers} ->
-            ok = send_pending(State, Member),
-            true = erlang:demonitor(MonitorRef, [flush]),
-            ok = remove_world_member(ChannelType, RoleId),
-            {reply, {ok, ChannelId},
-             State#channel_state{
-                 members = RemainingMembers,
-                 member_monitors = maps:remove(MonitorRef, MemberMonitors)
-             }};
+            case leave_member(ChannelId, State, RoleId, Member, Deadline) of
+                ok ->
+                    true = erlang:demonitor(MonitorRef, [flush]),
+                    ok = remove_world_member(ChannelType, RoleId),
+                    ok = remove_map_member(ChannelId, RoleId),
+                    {reply, {ok, ChannelId},
+                     State#channel_state{
+                         members = RemainingMembers,
+                         member_monitors = maps:remove(MonitorRef, MemberMonitors)
+                     }};
+                {error, channel_unavailable} ->
+                    {reply, {error, channel_unavailable}, State}
+            end;
         error ->
             {reply, {error, not_joined}, State}
     end;
@@ -196,14 +242,18 @@ handle_call({send_channel, RoleId, RoleName, Content}, _From,
         false ->
             {reply, {error, not_joined}, State};
         true ->
-            Packet = encode_push(ChannelId, RoleId, RoleName, Content),
-            {NewState, BatchFull} = enqueue(Packet, State),
-            case BatchFull of
-                true ->
-                    {reply, {ok, ChannelId}, NewState,
-                     {continue, flush_batch}};
-                false ->
-                    {reply, {ok, ChannelId}, NewState}
+            case map_broadcast_worker:available(ChannelId) of
+                false when ChannelId =:= {map, 1}; ChannelId =:= {map, 2};
+                           ChannelId =:= {map, 3} ->
+                    {reply, {error, channel_unavailable}, State};
+                _ ->
+                    Packet = encode_push(ChannelId, RoleId, RoleName, Content),
+                    {NewState, BatchFull} = enqueue(Packet, State),
+                    case BatchFull of
+                        true -> {reply, {ok, ChannelId}, NewState,
+                                 {continue, flush_batch}};
+                        false -> {reply, {ok, ChannelId}, NewState}
+                    end
             end
     end;
 handle_call(Request, _From, State) ->
@@ -219,6 +269,7 @@ handle_info({'DOWN', MonitorRef, process, _RolePid, _Reason},
     case maps:take(MonitorRef, MemberMonitors) of
         {RoleId, RemainingMonitors} ->
             ok = remove_world_member(ChannelType, RoleId),
+            ok = remove_map_member(State#channel_state.channel_id, RoleId),
             {noreply, State#channel_state{
                 members = maps:remove(RoleId, Members),
                 member_monitors = RemainingMonitors
@@ -248,13 +299,25 @@ create_world_members(?CHANNEL_TYPE_MAIN) ->
 create_world_members(?CHANNEL_TYPE_PUBLIC) ->
     ok.
 
-add_world_member(?CHANNEL_TYPE_MAIN, RoleId, RolePid) ->
+create_map_members({map, MapId}) ->
+    lists:foreach(fun(Table) ->
+        Table = ets:new(Table, [named_table, set, protected,
+                                {keypos, #map_channel_member.role_id},
+                                {read_concurrency, true}])
+    end, map_member_tables(MapId)),
+    ok;
+create_map_members(_ChannelId) -> ok.
+
+add_world_member(?CHANNEL_TYPE_MAIN, RoleId, RolePid, Socket, Writer) ->
     true = ets:insert(world_member_table(RoleId), #world_channel_member{
         role_id = RoleId,
-        role_pid = RolePid
+        role_pid = RolePid,
+        socket = Socket,
+        writer = Writer
     }),
     ok;
-add_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId, _RolePid) ->
+add_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId, _RolePid,
+                 _Socket, _Writer) ->
     ok.
 
 remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
@@ -262,6 +325,46 @@ remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
     ok;
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
+
+add_map_member({map, _MapId} = ChannelId, RoleId,
+               #channel_member{role_pid = RolePid, writer = Writer,
+                               batch_generation = Generation,
+                               batch_start = Start}) ->
+    case map_broadcast_worker:available(ChannelId) of
+        true ->
+            {map, MapId} = ChannelId,
+            Member = #map_channel_member{role_id = RoleId,
+                                         owner_pid = self(), role_pid = RolePid,
+                                         writer = Writer,
+                                         batch_generation = Generation,
+                                         batch_start = Start},
+            Table = map_member_table(MapId, RoleId),
+            true = ets:insert(Table, Member),
+            case map_broadcast_worker:join(ChannelId, RoleId, Member) of
+                ok -> ok;
+                {error, channel_unavailable} ->
+                    true = ets:delete(Table, RoleId),
+                    {error, channel_unavailable}
+            end;
+        false -> {error, channel_unavailable}
+    end;
+add_map_member(_ChannelId, _RoleId, _Member) -> ok.
+
+remove_map_member({map, MapId}, RoleId) ->
+    true = ets:delete(map_member_table(MapId, RoleId), RoleId),
+    _ = map_broadcast_worker:remove({map, MapId}, RoleId, self()),
+    ok;
+remove_map_member(_ChannelId, _RoleId) -> ok.
+
+leave_member({map, _MapId} = ChannelId,
+             #channel_state{packets = Packets, batch_size = BatchSize,
+                            batch_generation = Generation}, RoleId, _Member, Deadline) ->
+    map_broadcast_worker:leave(ChannelId, RoleId, Packets,
+                               BatchSize, Generation, self(), Deadline);
+leave_member(_ChannelId, State, _RoleId, Member, _Deadline) -> send_pending(State, Member).
+
+with_deadline({leave, RoleId}, Deadline) -> {leave, RoleId, Deadline};
+with_deadline(Request, _Deadline) -> Request.
 
 encode_push({map, MapId}, RoleId, RoleName, Content) ->
     chat_server_protocol:encode_map_chat_push(
@@ -297,15 +400,25 @@ flush_batch(Reason,
                            batch_generation = BatchGeneration} = State) ->
     cancel_flush_timer(State),
     OrderedPackets = lists:reverse(Packets),
-    {_, RolePackets, PayloadBytes} = maps:fold(
-        fun(_RoleId, Member, BatchAcc) ->
-            send_batch(ChannelId, BatchGeneration, BatchSize,
-                       OrderedPackets, Member, BatchAcc)
-        end,
-        {#{}, 0, 0},
-        Members),
+    {RolePackets, LogicalBytes, WireBytes} = case ChannelId of
+        {map, _MapId} ->
+            BatchPacket = encode_batch(ChannelId, OrderedPackets),
+            ok = map_broadcast_worker:broadcast(
+                ChannelId, BatchGeneration, BatchSize,
+                OrderedPackets, BatchPacket, self()),
+            {0, 0, 0};
+        _ ->
+            {_, Count, Logical, Wire} = maps:fold(
+                fun(_RoleId, Member, BatchAcc) ->
+                    send_batch(ChannelId, BatchGeneration, BatchSize,
+                               OrderedPackets, Member, BatchAcc)
+                end,
+                {#{}, 0, 0, 0}, Members),
+            {Count, Logical, Wire}
+    end,
     record_channel_batch(ChannelId, Reason, BatchSize),
-    record_map_delivery(ChannelId, 1, RolePackets, PayloadBytes),
+    record_map_delivery(
+        ChannelId, 1, RolePackets, LogicalBytes, WireBytes),
     State#channel_state{packets = [],
                         batch_size = 0,
                         batch_generation = BatchGeneration + 1,
@@ -318,24 +431,26 @@ send_batch(_ChannelId, BatchGeneration, BatchSize, _OrderedPackets,
     BatchAcc;
 send_batch(ChannelId, BatchGeneration, _BatchSize, OrderedPackets,
            #channel_member{role_pid = RolePid,
+                           writer = Writer,
                            batch_generation = MemberGeneration,
                            batch_start = MemberStart},
-           {BatchPackets, RolePackets, PayloadBytes}) ->
+           {BatchPackets, RolePackets, LogicalBytes, WireBytes}) ->
     BatchStart = case MemberGeneration =:= BatchGeneration of
         true -> MemberStart;
         false -> 0
     end,
-    {BatchPacket, NewBatchPackets} = batch_packet(
+    {{BatchPacket, LogicalSize, WireSize}, NewBatchPackets} = batch_packet(
         ChannelId, BatchStart, OrderedPackets, BatchPackets),
-    gen_server:cast(RolePid, {push_batch, BatchPacket}),
+    ok = role_server:send_push(RolePid, Writer, BatchPacket, map),
     {NewBatchPackets, RolePackets + 1,
-     PayloadBytes + byte_size(BatchPacket)}.
+     LogicalBytes + LogicalSize, WireBytes + WireSize}.
 
 send_pending(#channel_state{channel_id = ChannelId,
                             packets = Packets,
                             batch_size = BatchSize,
                             batch_generation = BatchGeneration},
              #channel_member{role_pid = RolePid,
+                             writer = Writer,
                              batch_generation = MemberGeneration,
                              batch_start = MemberStart}) ->
     BatchStart = case MemberGeneration =:= BatchGeneration of
@@ -343,27 +458,34 @@ send_pending(#channel_state{channel_id = ChannelId,
         false -> 0
     end,
     send_pending_batch(
-        ChannelId, RolePid, BatchStart, BatchSize, Packets).
+        ChannelId, RolePid, Writer, BatchStart, BatchSize, Packets).
 
-send_pending_batch(ChannelId, RolePid, BatchStart, BatchSize, Packets)
+send_pending_batch(ChannelId, RolePid, Writer,
+                   BatchStart, BatchSize, Packets)
   when BatchStart < BatchSize ->
     BatchPacket = encode_batch(
         ChannelId, lists:nthtail(BatchStart, lists:reverse(Packets))),
-    gen_server:cast(RolePid, {push_batch, BatchPacket}),
+    %% Keep the pending boundary behind the caller's join/leave reply.
+    ok = role_server:send_push(RolePid, Writer, BatchPacket, map),
+    {LogicalSize, WireSize} = chat_server_protocol:batch_sizes(BatchPacket),
     record_channel_batch(ChannelId, member_change, BatchSize - BatchStart),
-    record_map_delivery(ChannelId, 0, 1, byte_size(BatchPacket)),
+    record_map_delivery(ChannelId, 0, 1, LogicalSize, WireSize),
     ok;
-send_pending_batch(_ChannelId, _RolePid, _BatchStart, _BatchSize, _Packets) ->
+send_pending_batch(_ChannelId, _RolePid, _Writer,
+                   _BatchStart, _BatchSize, _Packets) ->
     ok.
 
 batch_packet(ChannelId, BatchStart, OrderedPackets, BatchPackets) ->
     case maps:find(BatchStart, BatchPackets) of
-        {ok, BatchPacket} ->
-            {BatchPacket, BatchPackets};
+        {ok, BatchInfo} ->
+            {BatchInfo, BatchPackets};
         error ->
             BatchPacket = encode_batch(
                 ChannelId, lists:nthtail(BatchStart, OrderedPackets)),
-            {BatchPacket, BatchPackets#{BatchStart => BatchPacket}}
+            {LogicalSize, WireSize} =
+                chat_server_protocol:batch_sizes(BatchPacket),
+            BatchInfo = {BatchPacket, LogicalSize, WireSize},
+            {BatchInfo, BatchPackets#{BatchStart => BatchInfo}}
     end.
 
 record_channel_batch(ChannelId, Reason, Size) ->
@@ -377,10 +499,12 @@ record_channel_batch(ChannelId, Reason, Size) ->
             true = ets:insert(channel_batch_metrics, {Key, 1, Size, Size})
     end.
 
-record_map_delivery({map, _MapId}, Flushes, RolePackets, PayloadBytes) ->
+record_map_delivery({map, _MapId}, Flushes, RolePackets,
+                    LogicalBytes, WireBytes) ->
     chat_metrics:record_broadcast_delivery(
-        map, Flushes, RolePackets, PayloadBytes);
-record_map_delivery(_ChannelId, _Flushes, _RolePackets, _PayloadBytes) ->
+        map, Flushes, RolePackets, LogicalBytes, WireBytes);
+record_map_delivery(_ChannelId, _Flushes, _RolePackets,
+                    _LogicalBytes, _WireBytes) ->
     ok.
 
 cancel_flush_timer(#channel_state{flush_ref = undefined}) ->
@@ -393,6 +517,11 @@ encode_batch({map, _MapId}, Packets) ->
     chat_server_protocol:encode_map_chat_push_batch(Packets);
 encode_batch(_ChannelId, Packets) ->
     chat_server_protocol:encode_channel_push_batch(Packets).
+
+connection_parts({Socket, Writer}) ->
+    {Socket, Writer};
+connection_parts(Socket) ->
+    {Socket, undefined}.
 
 channel_tuple(ChannelId) ->
     {ok, ChannelType, ChannelName} = channel(ChannelId),

@@ -7,11 +7,13 @@
          map_ids/0,
          default_map_id/0,
          join/4,
+         join/5,
          leave/2,
          relocate/2,
          nearby/1,
          location/1,
          operation_stats/0,
+         random_map_id/0,
          random_position/0,
          valid_map/1,
          valid_position/1]).
@@ -29,11 +31,15 @@ default_map_id() ->
     ?DEFAULT_MAP_ID.
 
 join(RoleId, RolePid, MapId, Position) ->
+    join(RoleId, RolePid, undefined, MapId, Position).
+
+join(RoleId, RolePid, Socket, MapId, Position) ->
     case valid_map(MapId) of
         true ->
             recover_join_result(
                 MapId, Position, RolePid,
-                map_worker:join(MapId, RoleId, RolePid, Position));
+                map_worker:join(
+                    MapId, RoleId, RolePid, Socket, Position));
         false -> {error, invalid_map}
     end.
 
@@ -76,6 +82,9 @@ operation_stats() ->
         fun merge_operation_stats/2,
         #{},
         [map_worker:operation_stats(MapId) || MapId <- map_ids()]).
+
+random_map_id() ->
+    lists:nth(rand:uniform(length(map_ids())), map_ids()).
 
 random_position() ->
     {rand:uniform(?MAP_SIZE) - 1, rand:uniform(?MAP_SIZE) - 1}.

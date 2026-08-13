@@ -2,6 +2,8 @@
 
 -include("chat_protocol.hrl").
 
+-define(MAX_INFLATE_STEPS, 256).
+
 -export([encode_login/2,
          encode_channel_list/0,
          encode_channel_join/1,
@@ -14,7 +16,8 @@
          encode_map_join/1,
          encode_map_leave/0,
          encode_map_chat_send/1,
-         decode_packet/1]).
+         decode_packet/1,
+         validate_push_packet/1]).
 
 encode_login(RoleName, Password) ->
     NameLength = byte_size(RoleName),
@@ -57,11 +60,11 @@ encode_map_chat_send(Content) ->
     <<?PROTO_MAP_CHAT_SEND_REQUEST:16, Content/binary>>.
 
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?RESULT_SUCCESS:8,
-                RoleId:32, X:8, Y:8,
+                RoleId:32, MapId:16, X:8, Y:8,
                 ChannelCount:16, ChannelData/binary>>)
   when byte_size(ChannelData) =:= ChannelCount * 4 ->
     ChannelIds = [ChannelId || <<ChannelId:32>> <= ChannelData],
-    {ok, {login_result, {ok, RoleId, {X, Y}, ChannelIds}}};
+    {ok, {login_result, {ok, RoleId, MapId, {X, Y}, ChannelIds}}};
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_INVALID_LOGIN:8>>) ->
     {ok, {login_result, {error, invalid_login}}};
 decode_packet(<<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_ALREADY_ONLINE:8>>) ->
@@ -97,9 +100,13 @@ decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16,
 decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16,
-                MessageCount:16, MessageData/binary>>) ->
+                MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
     decode_push_batch(
         channel_push_batch, channel_push, MessageCount, MessageData, []);
+decode_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
 decode_packet(<<?PROTO_CHANNEL_PUSH:16, ChannelId:32, SenderRoleId:32,
                 SenderNameLength:16, Data/binary>>) ->
     case Data of
@@ -167,9 +174,13 @@ decode_packet(<<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
 decode_packet(<<?PROTO_NEARBY_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_NEARBY_PUSH_BATCH:16,
-                MessageCount:16, MessageData/binary>>) ->
+                MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
     decode_push_batch(
         nearby_push_batch, nearby_push, MessageCount, MessageData, []);
+decode_packet(<<?PROTO_NEARBY_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
 decode_packet(<<?PROTO_MAP_JOIN_RESULT:16, ?RESULT_SUCCESS:8,
                 MapId:16, X:8, Y:8>>) ->
     {ok, {map_join_result, {ok, MapId, {X, Y}}}};
@@ -201,16 +212,128 @@ decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
 decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16,
-                MessageCount:16, MessageData/binary>>) ->
+                MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
     decode_push_batch(
         map_chat_push_batch, map_chat_push,
         MessageCount, MessageData, []);
+decode_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+decode_packet(<<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+                CompressedLength:32, CompressedData/binary>>)
+  when RawLength > 0, RawLength =< ?MAX_BATCH_BYTES,
+       CompressedLength > 0, CompressedLength =< ?MAX_BATCH_BYTES,
+       byte_size(CompressedData) =:= CompressedLength ->
+    case safe_uncompress(CompressedData, RawLength) of
+        {ok, <<InnerProto:16, _Data/binary>> = Packet}
+          when InnerProto =:= ?PROTO_CHANNEL_PUSH_BATCH;
+               InnerProto =:= ?PROTO_MAP_CHAT_PUSH_BATCH;
+               InnerProto =:= ?PROTO_NEARBY_PUSH_BATCH ->
+            decode_packet(Packet);
+        _ ->
+            {error, invalid_packet}
+    end;
+decode_packet(<<?PROTO_COMPRESSED_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
 decode_packet(<<?PROTO_ERROR:16, RequestProtoId:16, ErrorCode:8>>) ->
     {ok, {server_error, RequestProtoId, decode_error(ErrorCode)}};
 decode_packet(<<ProtoId:16, _Data/binary>>) ->
     {error, {unexpected_proto, ProtoId}};
 decode_packet(_Packet) ->
     {error, invalid_packet}.
+
+%% Capacity clients do not consume broadcast payloads, but must still reject
+%% malformed packets without constructing a map and list for every message.
+validate_push_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16,
+                       MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
+    validate_push_batch(?PROTO_CHANNEL_PUSH, MessageCount, MessageData);
+validate_push_packet(<<?PROTO_NEARBY_PUSH_BATCH:16,
+                       MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
+    validate_push_batch(?PROTO_NEARBY_PUSH, MessageCount, MessageData);
+validate_push_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16,
+                       MessageCount:16, MessageData/binary>>)
+  when MessageCount > 0, MessageCount =< ?MAX_BATCH_MESSAGES,
+       byte_size(MessageData) =< ?MAX_BATCH_BYTES ->
+    validate_push_batch(?PROTO_MAP_CHAT_PUSH, MessageCount, MessageData);
+validate_push_packet(<<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+                       CompressedLength:32, CompressedData/binary>>)
+  when RawLength > 0, RawLength =< ?MAX_BATCH_BYTES,
+       CompressedLength > 0, CompressedLength =< ?MAX_BATCH_BYTES,
+       byte_size(CompressedData) =:= CompressedLength ->
+    case safe_uncompress(CompressedData, RawLength) of
+        {ok, <<InnerProto:16, _Data/binary>> = Packet}
+          when InnerProto =:= ?PROTO_CHANNEL_PUSH_BATCH;
+               InnerProto =:= ?PROTO_MAP_CHAT_PUSH_BATCH;
+               InnerProto =:= ?PROTO_NEARBY_PUSH_BATCH ->
+            validate_push_packet(Packet);
+        _ ->
+            {error, invalid_packet}
+    end;
+validate_push_packet(<<?PROTO_CHANNEL_PUSH:16, _Data/binary>> = Packet) ->
+    validate_push(?PROTO_CHANNEL_PUSH, Packet);
+validate_push_packet(<<?PROTO_PRIVATE_PUSH:16, _Data/binary>> = Packet) ->
+    validate_push(?PROTO_PRIVATE_PUSH, Packet);
+validate_push_packet(<<?PROTO_NEARBY_PUSH:16, _Data/binary>> = Packet) ->
+    validate_push(?PROTO_NEARBY_PUSH, Packet);
+validate_push_packet(<<?PROTO_MAP_CHAT_PUSH:16, _Data/binary>> = Packet) ->
+    validate_push(?PROTO_MAP_CHAT_PUSH, Packet);
+validate_push_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+validate_push_packet(<<?PROTO_NEARBY_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+validate_push_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+validate_push_packet(<<?PROTO_COMPRESSED_PUSH_BATCH:16, _Data/binary>>) ->
+    {error, invalid_packet};
+validate_push_packet(_) ->
+    not_push.
+
+safe_uncompress(CompressedData, ExpectedSize) ->
+    Z = zlib:open(),
+    try
+        ok = zlib:inflateInit(Z, 15, error),
+        Result = safe_inflate(
+            Z, zlib:safeInflate(Z, CompressedData),
+            ExpectedSize, [], 0, ?MAX_INFLATE_STEPS),
+        ok = zlib:inflateEnd(Z),
+        Result
+    catch
+        _Class:_Reason -> {error, invalid_packet}
+    after
+        zlib:close(Z)
+    end.
+
+safe_inflate(_Z, {need_dictionary, _Adler, _Output},
+             _ExpectedSize, _Chunks, _Size, _StepsLeft) ->
+    {error, invalid_packet};
+safe_inflate(_Z, _Result, _ExpectedSize, _Chunks, _Size, 0) ->
+    {error, invalid_packet};
+safe_inflate(Z, {continue, Output}, ExpectedSize,
+             Chunks, Size, StepsLeft) ->
+    OutputSize = iolist_size(Output),
+    NewSize = Size + OutputSize,
+    case NewSize =< ExpectedSize of
+        true ->
+            safe_inflate(
+                Z, zlib:safeInflate(Z, []), ExpectedSize,
+                [Output | Chunks], NewSize, StepsLeft - 1);
+        false ->
+            {error, invalid_packet}
+    end;
+safe_inflate(_Z, {finished, Output}, ExpectedSize,
+             Chunks, Size, _StepsLeft) ->
+    OutputSize = iolist_size(Output),
+    case Size + OutputSize of
+        ExpectedSize ->
+            {ok, iolist_to_binary(lists:reverse([Output | Chunks]))};
+        _ ->
+            {error, invalid_packet}
+    end.
 
 decode_error(?ERROR_NOT_LOGGED_IN) -> not_logged_in;
 decode_error(?ERROR_INVALID_PACKET) -> invalid_packet;
@@ -237,6 +360,48 @@ decode_push_batch(BatchType, MessageType, Count,
     end;
 decode_push_batch(_BatchType, _MessageType, _Count, _Data, _Messages) ->
     {error, invalid_packet}.
+
+validate_push_batch(_MessageProto, 0, <<>>) ->
+    ok;
+validate_push_batch(MessageProto, Count,
+                    <<PacketLength:32, Data/binary>>)
+  when Count > 0 ->
+    case Data of
+        <<Packet:PacketLength/binary, RemainingData/binary>> ->
+            case validate_push(MessageProto, Packet) of
+                ok -> validate_push_batch(MessageProto, Count - 1, RemainingData);
+                Error -> Error
+            end;
+        _ ->
+            {error, invalid_packet}
+    end;
+validate_push_batch(_MessageProto, _Count, _Data) ->
+    {error, invalid_packet}.
+
+validate_push(?PROTO_CHANNEL_PUSH,
+              <<?PROTO_CHANNEL_PUSH:16, _ChannelId:32, _SenderRoleId:32,
+                SenderNameLength:16, Data/binary>>) ->
+    validate_named_content(SenderNameLength, Data);
+validate_push(?PROTO_PRIVATE_PUSH,
+              <<?PROTO_PRIVATE_PUSH:16, _SenderRoleId:32,
+                SenderNameLength:16, Data/binary>>) ->
+    validate_named_content(SenderNameLength, Data);
+validate_push(?PROTO_NEARBY_PUSH,
+              <<?PROTO_NEARBY_PUSH:16, _SenderRoleId:32, _X:8, _Y:8,
+                SenderNameLength:16, Data/binary>>) ->
+    validate_named_content(SenderNameLength, Data);
+validate_push(?PROTO_MAP_CHAT_PUSH,
+              <<?PROTO_MAP_CHAT_PUSH:16, _MapId:16, _SenderRoleId:32,
+                SenderNameLength:16, Data/binary>>) ->
+    validate_named_content(SenderNameLength, Data);
+validate_push(_MessageProto, _Packet) ->
+    {error, invalid_packet}.
+
+validate_named_content(NameLength, Data) ->
+    case Data of
+        <<_Name:NameLength/binary, _Content/binary>> -> ok;
+        _ -> {error, invalid_packet}
+    end.
 
 decode_channels(0, <<>>, Acc) ->
     {ok, lists:reverse(Acc)};

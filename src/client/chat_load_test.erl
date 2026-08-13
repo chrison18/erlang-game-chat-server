@@ -13,7 +13,8 @@
          send_map/2,
          set_feedback/2,
          position/1,
-         location/1]).
+         location/1,
+         metrics/0]).
 
 -define(DEFAULT_HOST, "127.0.0.1").
 -define(DEFAULT_PORT, 5555).
@@ -138,6 +139,25 @@ location(ClientId) when is_integer(ClientId), ClientId > 0 ->
     call_client(ClientId, location);
 location(_ClientId) ->
     {error, invalid_client_id}.
+
+metrics() ->
+    Pids = [Pid || {_Id, Pid, worker, _Modules} <-
+                       supervisor:which_children(chat_client_sup),
+                   is_pid(Pid)],
+    {QueueTotal, QueueMax} = lists:foldl(
+        fun(Pid, {Total, Max}) ->
+            {message_queue_len, Length} =
+                process_info(Pid, message_queue_len),
+            {Total + Length, erlang:max(Max, Length)}
+        end,
+        {0, 0},
+        Pids),
+    #{client_count => length(Pids),
+      client_queue_total => QueueTotal,
+      client_queue_max => QueueMax,
+      beam_process_count => erlang:system_info(process_count),
+      beam_port_count => erlang:system_info(port_count),
+      beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
 
 start_clients(ClientId, EndId, _Host, _Port, _LoadConfig, Count)
   when ClientId > EndId ->

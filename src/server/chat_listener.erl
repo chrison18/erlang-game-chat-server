@@ -10,7 +10,8 @@ start_link() ->
 
 init([]) ->
     Port = application:get_env(chat, port, 5555),
-    Options = [binary, {packet, 4}, {active, false}, {reuseaddr, true}],
+    Options = [binary, {packet, 4}, {active, false}, {reuseaddr, true},
+               {send_timeout, 5000}, {send_timeout_close, true}],
     case gen_tcp:listen(Port, Options) of
         {ok, ListenSocket} ->
             {ok, #{listen_socket => ListenSocket},

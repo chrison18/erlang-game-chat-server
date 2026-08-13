@@ -4,14 +4,33 @@
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
--export([start_link/0]).
+-export([start_link/0, send_push/3, send_push/4, writer/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_link() ->
     gen_server:start_link(?MODULE, [], []).
 
+send_push(RolePid, Writer, Packet) ->
+    send_push(RolePid, Writer, Packet, undefined).
+
+send_push(RolePid, undefined, Packet, _Type) ->
+    gen_server:cast(RolePid, {push_batch, Packet}),
+    ok;
+send_push(_RolePid, Writer, Packet, Type) ->
+    socket_writer:send_async(Writer, Packet, Type).
+
+writer(RolePid) when is_pid(RolePid) ->
+    case process_info(RolePid, dictionary) of
+        {dictionary, Dictionary} ->
+            proplists:get_value(socket_writer, Dictionary);
+        undefined ->
+            undefined
+    end;
+writer(_RolePid) ->
+    undefined.
+
 init([]) ->
-    {ok, #{socket => undefined}}.
+    {ok, #{socket => undefined, writer => undefined}}.
 
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
@@ -23,18 +42,21 @@ handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
     Packet = chat_server_protocol:encode_private_push(
         SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
-handle_cast({rejoin_channel, ChannelId}, State) ->
-    maybe_rejoin_channel(ChannelId),
+handle_cast({rejoin_channel, ChannelId}, #{socket := Socket} = State) ->
+    maybe_rejoin_channel(ChannelId, Socket),
     {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
 handle_info({socket_ready, Socket}, #{socket := undefined} = State) ->
+    {ok, Writer} = socket_writer:start_link(Socket, self()),
     case inet:setopts(Socket, [{active, true}]) of
         ok ->
-            {noreply, State#{socket := Socket}};
+            put(socket_writer, Writer),
+            {noreply, State#{socket := Socket, writer := Writer}};
         {error, Reason} ->
-            {stop, {socket_activation_failed, Reason}, State#{socket := Socket}}
+            {stop, {socket_activation_failed, Reason},
+             State#{socket := Socket, writer := Writer}}
     end;
 handle_info({tcp, Socket, Packet}, #{socket := Socket} = State) ->
     case handle_packet(Packet, Socket) of
@@ -49,12 +71,16 @@ handle_info({tcp_closed, Socket}, #{socket := Socket} = State) ->
     {stop, normal, State};
 handle_info({tcp_error, Socket, Reason}, #{socket := Socket} = State) ->
     {stop, {tcp_error, Reason}, State};
+handle_info({socket_writer_error, Writer, Reason},
+            #{writer := Writer} = State) ->
+    {stop, {tcp_send_failed, Reason}, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #{socket := undefined}) ->
     ok;
-terminate(_Reason, #{socket := Socket}) ->
+terminate(_Reason, #{socket := Socket, writer := Writer}) ->
+    Writer ! stop,
     gen_tcp:close(Socket).
 
 handle_packet(Packet, Socket) ->
@@ -131,7 +157,9 @@ handle_business_request(list_channels, Socket, _RoleId) ->
     send_packet(Socket,
         chat_server_protocol:encode_channel_list_result(ChannelList));
 handle_business_request({join_channel, ChannelId}, Socket, RoleId) ->
-    ProtocolResult = case channel_server:join(ChannelId, RoleId, self()) of
+    ProtocolResult = case channel_server:join(
+                              ChannelId, RoleId, self(),
+                              {Socket, get(socket_writer)}) of
         {ok, ChannelId} = Result ->
             put(channel_ids, maps:put(ChannelId, true, get(channel_ids))),
             Result;
@@ -187,7 +215,8 @@ handle_business_request({send_nearby, Content}, Socket, RoleId) ->
 handle_business_request({join_map, MapId}, Socket, RoleId) ->
     SpawnPosition = map_router:random_position(),
     ProtocolResult = case map_router:join(
-                              RoleId, self(), MapId, SpawnPosition) of
+                              RoleId, self(), {Socket, get(socket_writer)},
+                              MapId, SpawnPosition) of
         {ok, {MapId, Position}} ->
             put(map_id, MapId),
             put(position, Position),
@@ -241,11 +270,12 @@ handle_login(Socket, RoleName, Password) ->
 
 complete_login(Socket, RoleId, RoleName) ->
     InitialPosition = map_router:random_position(),
-    InitialMapId = map_router:default_map_id(),
+    InitialMapId = map_router:random_map_id(),
+    Connection = {Socket, get(socket_writer)},
     case map_router:join(
-             RoleId, self(), InitialMapId, InitialPosition) of
+             RoleId, self(), Connection, InitialMapId, InitialPosition) of
         {ok, {InitialMapId, InitialPosition}} ->
-            case join_initial_channels(RoleId) of
+            case join_initial_channels(RoleId, Connection) of
                 {ok, ChannelIds} ->
                     put(role_id, RoleId),
                     put(role_name, RoleName),
@@ -255,7 +285,8 @@ complete_login(Socket, RoleId, RoleName) ->
                         [{ChannelId, true} || ChannelId <- ChannelIds])),
                     send_packet(Socket,
                         chat_server_protocol:encode_login_result(
-                            {ok, RoleId, InitialPosition, ChannelIds}));
+                            {ok, RoleId, InitialMapId,
+                             InitialPosition, ChannelIds}));
                 {error, _Reason} ->
                     reject_unavailable_login(Socket)
             end;
@@ -271,7 +302,7 @@ reject_unavailable_login(Socket) ->
         Error -> Error
     end.
 
-join_initial_channels(RoleId) ->
+join_initial_channels(RoleId, Connection) ->
     PublicCount = rand:uniform(3),
     RandomizedPublicIds = [
         ChannelId
@@ -279,31 +310,35 @@ join_initial_channels(RoleId) ->
             lists:sort([{rand:uniform(), Id} || Id <- lists:seq(2, 10)])
     ],
     ChannelIds = [1 | lists:sublist(RandomizedPublicIds, PublicCount)],
-    case join_channels(ChannelIds, RoleId) of
+    case join_channels(ChannelIds, RoleId, Connection) of
         ok -> {ok, ChannelIds};
         Error -> Error
     end.
 
-join_channels([], _RoleId) ->
+join_channels([], _RoleId, _Connection) ->
     ok;
-join_channels([ChannelId | Rest], RoleId) ->
-    case channel_server:join(ChannelId, RoleId, self()) of
-        {ok, ChannelId} -> join_channels(Rest, RoleId);
+join_channels([ChannelId | Rest], RoleId, Connection) ->
+    case channel_server:join(ChannelId, RoleId, self(), Connection) of
+        {ok, ChannelId} -> join_channels(Rest, RoleId, Connection);
         {error, _Reason} = Error -> Error
     end.
 
-maybe_rejoin_channel({map, MapId}) ->
+maybe_rejoin_channel({map, MapId}, Socket) ->
     case get(map_id) of
         MapId ->
-            _ = channel_server:join_map(MapId, get(role_id), self()),
+            _ = channel_server:join_map(
+                MapId, get(role_id), self(),
+                {Socket, get(socket_writer)}),
             ok;
         _ ->
             ok
     end;
-maybe_rejoin_channel(ChannelId) ->
+maybe_rejoin_channel(ChannelId, Socket) ->
     case get(channel_ids) of
         #{ChannelId := true} ->
-            _ = channel_server:join(ChannelId, get(role_id), self()),
+            _ = channel_server:join(
+                ChannelId, get(role_id), self(),
+                {Socket, get(socket_writer)}),
             ok;
         _ ->
             ok
@@ -410,7 +445,5 @@ handle_push_send(Socket, Packet, State) ->
     end.
 
 send_packet(Socket, Packet) ->
-    case gen_tcp:send(Socket, Packet) of
-        ok -> ok;
-        {error, Reason} -> {error, {tcp_send_failed, Reason}}
-    end.
+    _ = Socket,
+    socket_writer:send_sync(get(socket_writer), Packet).

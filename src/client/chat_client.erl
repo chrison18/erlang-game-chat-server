@@ -243,7 +243,16 @@ normalize_text(Text) ->
             {error, invalid_text}
     end.
 
+handle_server_packet(Packet, #{mode := normal, feedback := false} = State) ->
+    case chat_client_protocol:validate_push_packet(Packet) of
+        ok -> State;
+        not_push -> handle_decoded_server_packet(Packet, State);
+        {error, Reason} -> handle_invalid_packet(Reason, State)
+    end;
 handle_server_packet(Packet, State) ->
+    handle_decoded_server_packet(Packet, State).
+
+handle_decoded_server_packet(Packet, State) ->
     case chat_client_protocol:decode_packet(Packet) of
         {ok, {channel_push_batch, Messages}} ->
             handle_channel_push_batch(Messages, State);
@@ -266,9 +275,9 @@ handle_server_packet(Packet, State) ->
     end.
 
 handle_response({login_result,
-                 {ok, _RoleId, Position, ChannelIds} = Result}, State) ->
+                 {ok, _RoleId, MapId, Position, ChannelIds} = Result}, State) ->
     LoggedInState = remember_channels(
-        ChannelIds, State#{map_id := ?DEFAULT_MAP_ID,
+        ChannelIds, State#{map_id := MapId,
                            position := Position}),
     report_result(login, Result, start_mode_after_login(LoggedInState));
 handle_response({login_result, Result}, State) ->
@@ -399,7 +408,7 @@ start_mode_after_login(#{mode := observer} = State) ->
     schedule_observer_report(),
     State;
 start_mode_after_login(#{mode := normal} = State) ->
-    schedule_next_action(),
+    schedule_next_action(initial_action_delay(State)),
     State;
 start_mode_after_login(#{mode := map_load} = State) ->
     do_teleport(rand:uniform(?MAP_SIZE) - 1,
@@ -409,9 +418,18 @@ start_mode_after_login(State) ->
     State.
 
 schedule_next_action() ->
+    schedule_next_action(?AUTO_SEND_INTERVAL_MS).
+
+schedule_next_action(DelayMs) ->
     _ = erlang:send_after(
-        ?AUTO_SEND_INTERVAL_MS, self(), auto_action),
+        DelayMs, self(), auto_action),
     ok.
+
+initial_action_delay(#{client_id := ClientId})
+  when is_integer(ClientId), ClientId > 0 ->
+    erlang:phash2(ClientId, ?AUTO_SEND_INTERVAL_MS);
+initial_action_delay(_State) ->
+    ?AUTO_SEND_INTERVAL_MS.
 
 schedule_observer_report() ->
     _ = erlang:send_after(

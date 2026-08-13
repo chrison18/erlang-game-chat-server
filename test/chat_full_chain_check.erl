@@ -26,6 +26,7 @@ check(Port) ->
     check_login_errors(Port),
     check_protocol_errors(Port),
     check_nearby_batch_worker(),
+    check_nearby_batch_metrics(),
     check_world_member_shards(2),
     BobRolePid = check_map_flow(Alice, AliceId, Bob, BobId),
     check_multi_map_flow(Alice, AliceId, Bob, BobId),
@@ -33,6 +34,10 @@ check(Port) ->
     check_map_channel_recovery(Alice, AliceId, Bob, BobId),
     check_map_channel_timeout(Bob),
     check_map_worker_recovery(Alice, AliceId, Bob, BobId),
+    check_map_batch_boundaries(Port, Alice, AliceId, Bob),
+    check_map_leave_does_not_wait_for_broadcast_worker(Port, Alice, AliceId, Bob),
+    check_map_broadcast_worker_recovery(Alice, AliceId, Bob),
+    check_relocate_waits_for_map_worker(Alice),
     check_pending_join_recovery(),
     check_map_worker_timeout(),
     check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId),
@@ -43,6 +48,7 @@ check(Port) ->
     check_public_channel_recovery(Alice, AliceId, Bob, BobId),
     check_role_packet_batch(Alice, AliceId),
     check_world_batch_order(Alice, AliceId, Bob),
+    check_socket_writer_broadcast(Alice, AliceId, Bob),
     check_private_flow(Alice, AliceId, Bob, BobId),
     check_worker_recovery(Alice, AliceId),
     check_nearby_worker_recovery(Alice, AliceId),
@@ -122,8 +128,8 @@ check_map_flow(Alice, AliceId, Bob, BobId) ->
     ok = sys:suspend(MapPid),
     try
         {ok, SuspendedTargets} = map_router:nearby({1, {0, 0}}),
-        true = lists:member(AliceRolePid, SuspendedTargets),
-        true = lists:member(BobRolePid, SuspendedTargets)
+        true = lists:keymember(AliceRolePid, 1, SuspendedTargets),
+        true = lists:keymember(BobRolePid, 1, SuspendedTargets)
     after
         ok = sys:resume(MapPid)
     end,
@@ -261,6 +267,13 @@ check_map_channel_unavailable(Port, Alice, AliceId, Bob, BobId) ->
     ChildId = {map_channel_server, 1},
     ok = supervisor:terminate_child(channel_sup, ChildId),
     undefined = whereis(map_channel_server_1),
+    lists:foreach(
+        fun({MapId, ChannelName}) ->
+            OtherChildId = {map_channel_server, MapId},
+            ok = supervisor:terminate_child(channel_sup, OtherChildId),
+            undefined = whereis(ChannelName)
+        end,
+        [{2, map_channel_server_2}, {3, map_channel_server_3}]),
 
     send(Alice, chat_client_protocol:encode_map_chat_send(<<"unavailable">>)),
     {map_chat_send_result, {error, map_unavailable, 1}} = recv(Alice),
@@ -283,6 +296,10 @@ check_map_channel_unavailable(Port, Alice, AliceId, Bob, BobId) ->
     2 = ets:info(online_roles, size),
 
     {ok, _ChannelPid} = supervisor:restart_child(channel_sup, ChildId),
+    {ok, _MapTwoChannelPid} = supervisor:restart_child(
+        channel_sup, {map_channel_server, 2}),
+    {ok, _MapThreeChannelPid} = supervisor:restart_child(
+        channel_sup, {map_channel_server, 3}),
     wait_until(fun() ->
         case catch sys:get_state(map_channel_server_1) of
             #channel_state{members = Members} ->
@@ -369,7 +386,7 @@ check_map_worker_recovery(Alice, AliceId, Bob, BobId) ->
     {ok, {1, {0, 0}}} = map_router:location(BobRolePid),
     ExpectedRolePids = lists:sort([AliceRolePid, BobRolePid]),
     ExpectedRolePids = lists:sort([
-        RolePid || {{1, 0, 0}, RolePid} <-
+        RolePid || {{1, 0, 0}, {RolePid, _Writer}} <-
                        ets:lookup(map_cells_1, {1, 0, 0})]),
     send(Alice, chat_client_protocol:encode_map_chat_send(
         <<"map-worker-recovered">>)),
@@ -379,6 +396,160 @@ check_map_worker_recovery(Alice, AliceId, Bob, BobId) ->
     expect_map_chat_push(
         Bob, 1, AliceId, <<"alice">>, <<"map-worker-recovered">>),
     true = AliceId =/= BobId.
+
+check_map_batch_boundaries(Port, Alice, AliceId, Bob) ->
+    Charlie = connect(Port),
+    send(Charlie, chat_client_protocol:encode_login(
+        <<"charlie">>, <<"pw">>)),
+    {login_result, {ok, _CharlieId, CharlieMapId,
+                    _Position, _Channels}} = recv(Charlie),
+    send(Charlie, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {ok, CharlieMapId}} = recv(Charlie),
+
+    BeforeJoinPacket = chat_server_protocol:encode_map_chat_push(
+        1, AliceId, <<"alice">>, <<"before-map-join">>),
+    _ = sys:replace_state(
+        map_channel_server_1,
+        fun(#channel_state{packets = [], batch_size = 0} = State) ->
+            State#channel_state{packets = [BeforeJoinPacket], batch_size = 1}
+        end),
+    send(Charlie, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {ok, 1, JoinPosition}} = recv(Charlie),
+    true = map_router:valid_position(JoinPosition),
+    send(Alice, chat_client_protocol:encode_map_chat_send(
+        <<"after-map-join">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    {map_chat_push_batch, AliceMessages} = recv(Alice),
+    {map_chat_push_batch, BobMessages} = recv(Bob),
+    {map_chat_push_batch, CharlieMessages} = recv(Charlie),
+    [<<"before-map-join">>, <<"after-map-join">>] =
+        map_message_contents(AliceMessages, 1, AliceId),
+    [<<"before-map-join">>, <<"after-map-join">>] =
+        map_message_contents(BobMessages, 1, AliceId),
+    [<<"after-map-join">>] =
+        map_message_contents(CharlieMessages, 1, AliceId),
+
+    send(Alice, chat_client_protocol:encode_map_chat_send(
+        <<"before-map-leave">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    send(Charlie, chat_client_protocol:encode_map_leave()),
+    recv_map_leave(Charlie, AliceId),
+    expect_map_chat_push(
+        Alice, 1, AliceId, <<"alice">>, <<"before-map-leave">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"before-map-leave">>),
+    gen_tcp:close(Charlie).
+
+recv_map_leave(Socket, SenderId) ->
+    recv_map_leave(Socket, SenderId, false, false).
+
+recv_map_leave(_Socket, _SenderId, true, true) ->
+    ok;
+recv_map_leave(Socket, SenderId, SawResult, SawBatch) ->
+    case recv(Socket) of
+        {map_leave_result, {ok, 1}} ->
+            recv_map_leave(Socket, SenderId, true, SawBatch);
+        {map_chat_push_batch, Messages} ->
+            [<<"before-map-leave">>] =
+                map_message_contents(Messages, 1, SenderId),
+            recv_map_leave(Socket, SenderId, SawResult, true)
+    end.
+
+check_map_leave_does_not_wait_for_broadcast_worker(Port, Alice, AliceId, Bob) ->
+    {Charlie, CharlieId, _Channels} = login(
+        Port, <<"leave_barrier">>, <<"pw">>),
+    Worker = worker_for(CharlieId),
+    ok = sys:suspend(Worker),
+    try
+        send(Alice, chat_client_protocol:encode_map_chat_send(
+            <<"leave-barrier-tail">>)),
+        {map_chat_send_result, {ok, 1}} = recv(Alice),
+        wait_until(fun() ->
+            {message_queue_len, Length} = process_info(Worker, message_queue_len),
+            Length > 0
+        end),
+        send(Charlie, chat_client_protocol:encode_map_leave()),
+        {map_leave_result, {ok, 1}} = recv(Charlie, 1000),
+        send(Alice, chat_client_protocol:encode_map_chat_send(
+            <<"leave-barrier-after">>)),
+        {map_chat_send_result, {ok, 1}} = recv(Alice)
+    after
+        ok = sys:resume(Worker)
+    end,
+    expect_map_chat_push(
+        Alice, 1, AliceId, <<"alice">>, <<"leave-barrier-tail">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"leave-barrier-tail">>),
+    expect_map_chat_push(
+        Alice, 1, AliceId, <<"alice">>, <<"leave-barrier-after">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"leave-barrier-after">>),
+    expect_map_chat_push(
+        Charlie, 1, AliceId, <<"alice">>, <<"leave-barrier-tail">>),
+    {error, timeout} = gen_tcp:recv(Charlie, 0, 300),
+    send(Charlie, chat_client_protocol:encode_map_join(1)),
+    {map_join_result, {ok, 1, JoinPosition}} = recv(Charlie),
+    true = map_router:valid_position(JoinPosition),
+    gen_tcp:close(Charlie).
+
+worker_for(RoleId) ->
+    WorkerIndex = erlang:phash2(
+        RoleId, map_broadcast_worker:worker_count()) + 1,
+    whereis(map_broadcast_worker_name(WorkerIndex)).
+
+map_broadcast_worker_name(1) -> map_broadcast_worker_1_1;
+map_broadcast_worker_name(2) -> map_broadcast_worker_1_2;
+map_broadcast_worker_name(3) -> map_broadcast_worker_1_3;
+map_broadcast_worker_name(4) -> map_broadcast_worker_1_4;
+map_broadcast_worker_name(5) -> map_broadcast_worker_1_5;
+map_broadcast_worker_name(6) -> map_broadcast_worker_1_6;
+map_broadcast_worker_name(7) -> map_broadcast_worker_1_7;
+map_broadcast_worker_name(8) -> map_broadcast_worker_1_8.
+
+check_map_broadcast_worker_recovery(Alice, AliceId, Bob) ->
+    WorkerIndex = erlang:phash2(
+        AliceId, map_broadcast_worker:worker_count()) + 1,
+    WorkerId = {map_broadcast_worker, 1, WorkerIndex},
+    Channel = whereis(map_channel_server_1),
+    ok = supervisor:terminate_child(channel_sup, WorkerId),
+    send(Alice, chat_client_protocol:encode_map_chat_send(
+        <<"map-worker-down">>)),
+    {map_chat_send_result, {error, map_unavailable, 1}} = recv(Alice),
+    send(Alice, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {error, map_unavailable, 1}} = recv(Alice),
+    Channel = whereis(map_channel_server_1),
+    {ok, {1, _Position}} = map_router:location(role_pid(<<"alice">>)),
+
+    {ok, _WorkerPid} = supervisor:restart_child(channel_sup, WorkerId),
+    send(Alice, chat_client_protocol:encode_map_chat_send(
+        <<"map-worker-up">>)),
+    {map_chat_send_result, {ok, 1}} = recv(Alice),
+    expect_map_chat_push(
+        Alice, 1, AliceId, <<"alice">>, <<"map-worker-up">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"map-worker-up">>).
+
+check_relocate_waits_for_map_worker(Alice) ->
+    RolePid = role_pid(<<"alice">>),
+    Worker = whereis(map_worker_1),
+    ok = sys:suspend(Worker),
+    try
+        send(Alice, chat_client_protocol:encode_teleport(3, 3)),
+        {error, timeout} = gen_tcp:recv(Alice, 0, 100),
+        {ok, {1, {0, 0}}} = map_router:location(RolePid),
+        [] = ets:lookup(map_cells_1, {1, 3, 3})
+    after
+        ok = sys:resume(Worker)
+    end,
+    {teleport_result, {ok, {3, 3}}} = recv(Alice),
+    {ok, {1, {3, 3}}} = map_router:location(RolePid),
+    [{{1, 3, 3}, {RolePid, _Writer}}] =
+        ets:lookup(map_cells_1, {1, 3, 3}),
+    false = lists:member(
+        RolePid,
+        [Pid || {{1, 0, 0}, {Pid, _}} <-
+                    ets:lookup(map_cells_1, {1, 0, 0})]),
+    teleport_to(Alice, {0, 0}).
 
 check_map_worker_timeout() ->
     Worker = whereis(map_worker_3),
@@ -423,8 +594,9 @@ teleport_to(Socket, {X, Y} = Position) ->
 check_map_cleanup(BobRolePid) ->
     wait_until(fun() -> map_position(BobRolePid) =:= error end),
     AliceRolePid = role_pid(<<"alice">>),
-    {ok, [AliceRolePid]} = map_router:nearby({1, {0, 0}}),
-    [{{1, 0, 0}, AliceRolePid}] = ets:lookup(map_cells_1, {1, 0, 0}),
+    {ok, [{AliceRolePid, _AliceWriter}]} = map_router:nearby({1, {0, 0}}),
+    [{{1, 0, 0}, {AliceRolePid, _}}] =
+        ets:lookup(map_cells_1, {1, 0, 0}),
     ok.
 
 check_channel_flow(Alice, AliceId, AliceChannels, Bob, BobId) ->
@@ -494,11 +666,9 @@ check_channel_batch_boundaries(Alice, AliceId, Bob) ->
         2, <<"before-leave">>)),
     {channel_send_result, {ok, 2}} = recv(Alice),
     send(Bob, chat_client_protocol:encode_channel_leave(2)),
-    {channel_leave_result, {ok, 2}} = recv(Bob),
+    recv_channel_leave(Bob, 2, AliceId),
     expect_channel_push(
         Alice, 2, AliceId, <<"alice">>, <<"before-leave">>),
-    expect_channel_push(
-        Bob, 2, AliceId, <<"alice">>, <<"before-leave">>),
 
     send(Alice, chat_client_protocol:encode_channel_send(
         2, <<"after-leave">>)),
@@ -506,6 +676,21 @@ check_channel_batch_boundaries(Alice, AliceId, Bob) ->
     expect_channel_push(
         Alice, 2, AliceId, <<"alice">>, <<"after-leave">>),
     {error, timeout} = gen_tcp:recv(Bob, 0, 100).
+
+recv_channel_leave(Socket, ChannelId, SenderId) ->
+    recv_channel_leave(Socket, ChannelId, SenderId, false, false).
+
+recv_channel_leave(_Socket, _ChannelId, _SenderId, true, true) ->
+    ok;
+recv_channel_leave(Socket, ChannelId, SenderId, SawResult, SawBatch) ->
+    case recv(Socket) of
+        {channel_leave_result, {ok, ChannelId}} ->
+            recv_channel_leave(Socket, ChannelId, SenderId, true, SawBatch);
+        {channel_push_batch, Messages} ->
+            [<<"before-leave">>] =
+                channel_message_contents(Messages, ChannelId, SenderId),
+            recv_channel_leave(Socket, ChannelId, SenderId, SawResult, true)
+    end.
 
 check_channel_full_batch(Alice, AliceId) ->
     PrefixPacket = chat_server_protocol:encode_channel_push(
@@ -657,7 +842,92 @@ check_role_packet_batch(Alice, AliceId) ->
     {error, invalid_packet} = chat_client_protocol:decode_packet(
         chat_server_protocol:encode_nearby_push_batch(Packets)),
     {error, invalid_packet} = chat_client_protocol:decode_packet(
-        <<?PROTO_NEARBY_PUSH_BATCH:16, 1:16, 8:32, 1:8>>).
+        <<?PROTO_NEARBY_PUSH_BATCH:16, 1:16, 8:32, 1:8>>),
+    check_compressed_batch_protocol(AliceId).
+
+check_compressed_batch_protocol(AliceId) ->
+    ChannelPackets = lists:duplicate(
+        40,
+        chat_server_protocol:encode_channel_push(
+            1, AliceId, <<"alice">>, <<"compressed-channel">>)),
+    <<?PROTO_COMPRESSED_PUSH_BATCH:16, _/binary>> =
+        CompressedChannel =
+            chat_server_protocol:encode_channel_push_batch(ChannelPackets),
+    {ok, {channel_push_batch, ChannelMessages}} =
+        chat_client_protocol:decode_packet(CompressedChannel),
+    40 = length(ChannelMessages),
+
+    MapPackets = lists:duplicate(
+        40,
+        chat_server_protocol:encode_map_chat_push(
+            1, AliceId, <<"alice">>, <<"compressed-map">>)),
+    <<?PROTO_COMPRESSED_PUSH_BATCH:16, _/binary>> =
+        CompressedMap =
+            chat_server_protocol:encode_map_chat_push_batch(MapPackets),
+    {ok, {map_chat_push_batch, MapMessages}} =
+        chat_client_protocol:decode_packet(CompressedMap),
+    40 = length(MapMessages),
+
+    SmallPacket = chat_server_protocol:encode_channel_push(
+        1, AliceId, <<>>, <<>>),
+    <<?PROTO_CHANNEL_PUSH_BATCH:16, _/binary>> =
+        chat_server_protocol:encode_channel_push_batch([SmallPacket]),
+
+    RawChannel = raw_batch(?PROTO_CHANNEL_PUSH_BATCH, ChannelPackets),
+    RawNearby = raw_batch(
+        ?PROTO_NEARBY_PUSH_BATCH,
+        [chat_server_protocol:encode_nearby_push(
+             AliceId, <<"alice">>, 1, 2, <<"compressed-nearby">>)]),
+    {ok, {nearby_push_batch, [_]}} =
+        chat_client_protocol:decode_packet(compressed_batch(RawNearby)),
+
+    <<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+      CompressedLength:32, CompressedData/binary>> =
+        compressed_batch(RawChannel),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, (RawLength + 1):32,
+          CompressedLength:32, CompressedData/binary>>),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+          (CompressedLength + 1):32, CompressedData/binary>>),
+    Truncated = binary:part(CompressedData, 0, CompressedLength - 1),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+          (byte_size(Truncated)):32, Truncated/binary>>),
+    WithTrailingByte = <<CompressedData/binary, 0>>,
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+          (byte_size(WithTrailingByte)):32, WithTrailingByte/binary>>),
+    Damaged = <<0, CompressedData/binary>>,
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, RawLength:32,
+          (byte_size(Damaged)):32, Damaged/binary>>),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        compressed_batch(compressed_batch(RawChannel))),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        compressed_batch(chat_server_protocol:encode_private_push(
+            AliceId, <<"alice">>, <<"private">>))),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        raw_batch(?PROTO_CHANNEL_PUSH_BATCH,
+                  lists:duplicate(?MAX_BATCH_MESSAGES + 1, SmallPacket))),
+    Bomb = zlib:compress(binary:copy(<<0>>, ?MAX_BATCH_BYTES + 1)),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16, ?MAX_BATCH_BYTES:32,
+          (byte_size(Bomb)):32, Bomb/binary>>),
+    {error, invalid_packet} = chat_client_protocol:decode_packet(
+        <<?PROTO_COMPRESSED_PUSH_BATCH:16,
+          (?MAX_BATCH_BYTES + 1):32, 1:32, 0>>).
+
+raw_batch(ProtoId, Packets) ->
+    iolist_to_binary([
+        <<ProtoId:16, (length(Packets)):16>>,
+        [<<(byte_size(Packet)):32, Packet/binary>> || Packet <- Packets]
+    ]).
+
+compressed_batch(Packet) ->
+    Compressed = zlib:compress(Packet),
+    <<?PROTO_COMPRESSED_PUSH_BATCH:16, (byte_size(Packet)):32,
+      (byte_size(Compressed)):32, Compressed/binary>>.
 
 check_nearby_batch_worker() ->
     Packet1 = chat_server_protocol:encode_nearby_push(
@@ -682,6 +952,42 @@ check_nearby_batch_worker() ->
         ok
     end.
 
+check_nearby_batch_metrics() ->
+    Before = nearby_batch_metrics(1),
+    Packet = chat_server_protocol:encode_nearby_push(
+        9002, <<"metrics">>, 0, 0, <<"batch">>),
+    ok = nearby_broadcast_worker:send(1, {0, 0}, Packet, [self()]),
+    ok = nearby_broadcast_worker:send(1, {1, 0}, Packet, [self()]),
+    receive {'$gen_cast', {push_batch, _}} -> ok after ?TIMEOUT ->
+        error(nearby_metrics_timeout)
+    end,
+    receive {'$gen_cast', {push_batch, _}} -> ok after ?TIMEOUT ->
+        error(nearby_metrics_timeout)
+    end,
+    {Messages, Targets, Flushes, BatchMessages, BatchMax} =
+        nearby_batch_metrics(1),
+    {BeforeMessages, BeforeTargets, BeforeFlushes,
+     BeforeBatchMessages, BeforeBatchMax} = Before,
+    true = Messages =:= BeforeMessages + 2,
+    true = Targets =:= BeforeTargets + 2,
+    true = Flushes =:= BeforeFlushes + 2,
+    true = BatchMessages =:= BeforeBatchMessages + 2,
+    true = BatchMax =:= erlang:max(BeforeBatchMax, 1).
+
+nearby_batch_metrics(MapId) ->
+    lists:foldl(
+        fun({{_MetricMapId, _WorkerIndex}, Messages, Targets, Flushes,
+             BatchMessages, BatchMax},
+            {MessageTotal, TargetTotal, FlushTotal,
+             BatchMessageTotal, BatchMaxTotal}) ->
+            {MessageTotal + Messages, TargetTotal + Targets,
+             FlushTotal + Flushes, BatchMessageTotal + BatchMessages,
+             erlang:max(BatchMaxTotal, BatchMax)}
+        end,
+        {0, 0, 0, 0, 0},
+        ets:match_object(nearby_batch_metrics,
+                         {{MapId, '_'}, '_', '_', '_', '_', '_'})).
+
 check_world_batch_order(Alice, AliceId, Bob) ->
     send(Alice, chat_client_protocol:encode_channel_send(1, <<"order-1">>)),
     send(Alice, chat_client_protocol:encode_channel_send(1, <<"order-2">>)),
@@ -691,6 +997,52 @@ check_world_batch_order(Alice, AliceId, Bob) ->
         recv_world_contents(Bob, AliceId, 2, 0),
     {error, timeout} = gen_tcp:recv(Alice, 0, 100),
     {error, timeout} = gen_tcp:recv(Bob, 0, 100).
+
+check_socket_writer_broadcast(Alice, AliceId, Bob) ->
+    BobRolePid = role_pid(<<"bob">>),
+    {BobServerSocket, BobWriter} = world_member_connection(BobRolePid),
+    #channel_state{members = MapMembers} =
+        sys:get_state(map_channel_server_1),
+    #channel_member{role_pid = BobRolePid,
+                    socket = BobServerSocket,
+                    writer = BobWriter} =
+        maps:get(role_id(<<"bob">>), MapMembers),
+    true = erlang:suspend_process(BobWriter),
+    try
+        send(Alice, chat_client_protocol:encode_channel_send(
+            1, <<"direct-world">>)),
+        {channel_send_result, {ok, 1}} = recv(Alice),
+        expect_channel_push(
+            Alice, 1, AliceId, <<"alice">>, <<"direct-world">>),
+        {error, timeout} = gen_tcp:recv(Bob, 0, 100),
+
+        send(Alice, chat_client_protocol:encode_map_chat_send(
+            <<"direct-map">>)),
+        {map_chat_send_result, {ok, 1}} = recv(Alice),
+        expect_map_chat_push(
+            Alice, 1, AliceId, <<"alice">>, <<"direct-map">>),
+        {message_queue_len, 0} =
+            process_info(BobRolePid, message_queue_len),
+        {message_queue_len, 2} =
+            process_info(BobWriter, message_queue_len)
+    after
+        true = erlang:resume_process(BobWriter)
+    end,
+    expect_channel_push(
+        Bob, 1, AliceId, <<"alice">>, <<"direct-world">>),
+    expect_map_chat_push(
+        Bob, 1, AliceId, <<"alice">>, <<"direct-map">>).
+
+world_member_connection(RolePid) ->
+    [#world_channel_member{role_pid = RolePid,
+                           socket = Socket,
+                           writer = Writer}] =
+        [Member
+         || Table <- channel_server:world_member_tables(),
+            #world_channel_member{role_pid = MemberPid} = Member <-
+                ets:tab2list(Table),
+            MemberPid =:= RolePid],
+    {Socket, Writer}.
 
 check_worker_recovery(Alice, AliceId) ->
     WorkerIndex = erlang:phash2(
@@ -720,15 +1072,23 @@ check_metrics() ->
     3 = maps:get(map_worker_count, Metrics),
     #{1 := MapOneQueue, 2 := MapTwoQueue, 3 := MapThreeQueue} =
         maps:get(map_worker_queues, Metrics),
+    #{1 := MapOneRoles, 2 := MapTwoRoles, 3 := MapThreeRoles} =
+        maps:get(map_role_counts, Metrics),
     true = lists:all(
         fun erlang:is_integer/1,
         [MapOneQueue, MapTwoQueue, MapThreeQueue]),
-    3 = maps:get(nearby_worker_count, Metrics),
+    true = MapOneRoles + MapTwoRoles + MapThreeRoles =:=
+           maps:get(online_count, Metrics),
+    6 = maps:get(nearby_worker_count, Metrics),
+    24 = maps:get(map_broadcast_worker_count, Metrics),
+    true = maps:get(map_broadcast_worker_queue_total, Metrics) >= 0,
     true = maps:get(nearby_messages, Metrics) > 0,
     true = maps:get(nearby_flushes, Metrics) > 0,
     true = maps:get(nearby_batch_max, Metrics) >= 2,
     true = maps:get(channel_timer_flushes, Metrics) > 0,
     true = maps:get(channel_full_flushes, Metrics) > 0,
+    true = maps:get(socket_writer_count, Metrics) > 0,
+    true = maps:get(socket_writer_queue_total, Metrics) >= 0,
     true = lists:all(
         fun(Key) -> maps:get(Key, Metrics) > 0 end,
         [world_batch_flushes, world_role_packets, world_payload_bytes,
@@ -756,11 +1116,12 @@ check_real_client(Port) ->
     ClientChannels = maps:get(channel_ids, State),
     check_initial_channels(ClientChannels),
     false = maps:get(feedback, State),
-    1 = maps:get(map_id, State),
+    InitialMapId = maps:get(map_id, State),
+    true = lists:member(InitialMapId, map_router:map_ids()),
     SpawnPosition = maps:get(position, State),
     true = map_router:valid_position(SpawnPosition),
     {ok, SpawnPosition} = chat_load_test:position(101),
-    {ok, {1, SpawnPosition}} = chat_load_test:location(101),
+    {ok, {InitialMapId, SpawnPosition}} = chat_load_test:location(101),
     {error, invalid_feedback} = chat_load_test:set_feedback(101, loud),
     ok = chat_load_test:set_feedback(101, true),
     true = maps:get(feedback, sys:get_state(ClientPid)),
@@ -768,6 +1129,8 @@ check_real_client(Port) ->
         fun(Key) -> maps:is_key(Key, State) end,
         [status, role_id, password, action_state, client_id, client_range]),
     ClientRolePid = role_pid(<<"client_101">>),
+    {ok, {InitialMapId, SpawnPosition}} = map_location(ClientRolePid),
+    ok = move_client_to_map(101, 1),
     ok = chat_load_test:teleport(101, 0, 0),
     wait_until(fun() ->
         map_position(ClientRolePid) =:= {ok, {0, 0}} andalso
@@ -863,9 +1226,10 @@ check_map_load_client() ->
         map_router:valid_position(maps:get(position, State))
     end),
     {ok, Position} = chat_load_test:position(102),
-    {ok, {1, Position}} = chat_load_test:location(102),
+    {ok, {MapId, Position}} = chat_load_test:location(102),
+    true = lists:member(MapId, map_router:map_ids()),
     {ok, Position} = map_position(role_pid(<<"client_102">>)),
-    {ok, {1, Position}} = map_location(role_pid(<<"client_102">>)),
+    {ok, {MapId, Position}} = map_location(role_pid(<<"client_102">>)),
     ClientPid ! auto_action,
     wait_until(fun() ->
         maps:get(action_seq, sys:get_state(ClientPid)) >= 2
@@ -1113,9 +1477,35 @@ role_id(RoleName) ->
 login(Port, RoleName, Password) ->
     Socket = connect(Port),
     send(Socket, chat_client_protocol:encode_login(RoleName, Password)),
-    {login_result, {ok, RoleId, Position, ChannelIds}} = recv(Socket),
+    {login_result, {ok, RoleId, MapId, Position, ChannelIds}} = recv(Socket),
+    true = lists:member(MapId, map_router:map_ids()),
     true = map_router:valid_position(Position),
+    ok = move_socket_to_map(Socket, MapId, 1),
     {Socket, RoleId, ChannelIds}.
+
+move_socket_to_map(_Socket, MapId, MapId) ->
+    ok;
+move_socket_to_map(Socket, CurrentMapId, TargetMapId) ->
+    send(Socket, chat_client_protocol:encode_map_leave()),
+    {map_leave_result, {ok, CurrentMapId}} = recv(Socket),
+    send(Socket, chat_client_protocol:encode_map_join(TargetMapId)),
+    {map_join_result, {ok, TargetMapId, Position}} = recv(Socket),
+    true = map_router:valid_position(Position),
+    ok.
+
+move_client_to_map(ClientId, MapId) ->
+    case chat_load_test:location(ClientId) of
+        {ok, {MapId, _Position}} ->
+            ok;
+        {ok, {_CurrentMapId, _Position}} ->
+            ok = chat_load_test:leave_map(ClientId),
+            wait_until(fun() ->
+                chat_load_test:location(ClientId) =:= {error, not_in_map}
+            end),
+            ok = chat_load_test:join_map(ClientId, MapId),
+            wait_until(fun() -> valid_client_location(ClientId, MapId) end),
+            ok
+    end.
 
 valid_client_location(ClientId, MapId) ->
     case chat_load_test:location(ClientId) of

@@ -3,7 +3,9 @@
 -include("chat_record.hrl").
 
 -export([snapshot/0, online_clients/0, print_online_clients/0,
-         record_broadcast_delivery/4]).
+         record_broadcast_delivery/5,
+         record_broadcast_send_failure/1,
+         record_broadcast_send_failures/2]).
 
 snapshot() ->
     {RoleCount, RoleQueueTotal, RoleQueueMax} =
@@ -18,17 +20,26 @@ snapshot() ->
      || MapId <- map_router:map_ids()]),
     {WorkerCount, WorkerQueueTotal, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
+    {MapBroadcastWorkerCount, MapBroadcastWorkerQueueTotal,
+     MapBroadcastWorkerQueueMax} =
+        queue_stats(child_pids(channel_sup, map_broadcast_worker)),
     NearbyWorkers = child_pids(channel_sup, nearby_broadcast_worker),
     {NearbyWorkerCount, NearbyQueueTotal, NearbyQueueMax} =
         queue_stats(NearbyWorkers),
     NearbyStats = nearby_stats(),
     ChannelBatchStats = channel_batch_stats(),
-    {WorldFlushes, WorldRolePackets, WorldPayloadBytes} =
+    {WorldFlushes, WorldRolePackets, WorldLogicalBytes,
+     WorldWireBytes, WorldSendFailures} =
         broadcast_delivery_stats(world),
-    {MapFlushes, MapRolePackets, MapPayloadBytes} =
+    {MapFlushes, MapRolePackets, MapLogicalBytes,
+     MapWireBytes, MapSendFailures} =
         broadcast_delivery_stats(map),
-    {NearbyDeliveryFlushes, NearbyRolePackets, NearbyPayloadBytes} =
+    {NearbyDeliveryFlushes, NearbyRolePackets, NearbyLogicalBytes,
+     NearbyWireBytes, NearbySendFailures} =
         broadcast_delivery_stats(nearby),
+    {SocketWriterCount, SocketWriterQueueTotal, SocketWriterQueueMax} =
+        socket_writer_queue_stats(),
+    {SocketSendPendTotal, SocketSendPendMax} = socket_send_pend_stats(),
     #{node => node(),
       schedulers_online => erlang:system_info(schedulers_online),
       online_count => table_size(online_roles),
@@ -37,6 +48,11 @@ snapshot() ->
       role_count => RoleCount,
       role_queue_total => RoleQueueTotal,
       role_queue_max => RoleQueueMax,
+      socket_writer_count => SocketWriterCount,
+      socket_writer_queue_total => SocketWriterQueueTotal,
+      socket_writer_queue_max => SocketWriterQueueMax,
+      socket_send_pend_total => SocketSendPendTotal,
+      socket_send_pend_max => SocketSendPendMax,
       channel_count => ChannelCount,
       channel_queue_total => ChannelQueueTotal,
       channel_queue_max => ChannelQueueMax,
@@ -45,9 +61,15 @@ snapshot() ->
       map_worker_queue_total => MapWorkerQueueTotal,
       map_worker_queue_max => MapWorkerQueueMax,
       map_worker_queues => MapWorkerQueues,
+      map_role_counts => maps:from_list([
+          {MapId, table_size(map_worker:cell_table(MapId))}
+       || MapId <- map_router:map_ids()]),
       world_worker_count => WorkerCount,
       world_worker_queue_total => WorkerQueueTotal,
       world_worker_queue_max => WorkerQueueMax,
+      map_broadcast_worker_count => MapBroadcastWorkerCount,
+      map_broadcast_worker_queue_total => MapBroadcastWorkerQueueTotal,
+      map_broadcast_worker_queue_max => MapBroadcastWorkerQueueMax,
       nearby_worker_count => NearbyWorkerCount,
       nearby_worker_queue_total => NearbyQueueTotal,
       nearby_worker_queue_max => NearbyQueueMax,
@@ -63,22 +85,45 @@ snapshot() ->
       channel_batch_max => maps:get(max, ChannelBatchStats),
       world_batch_flushes => WorldFlushes,
       world_role_packets => WorldRolePackets,
-      world_payload_bytes => WorldPayloadBytes,
+      world_logical_bytes => WorldLogicalBytes,
+      world_wire_bytes => WorldWireBytes,
+      world_payload_bytes => WorldWireBytes,
+      world_send_failures => WorldSendFailures,
       map_batch_flushes => MapFlushes,
       map_role_packets => MapRolePackets,
-      map_payload_bytes => MapPayloadBytes,
+      map_logical_bytes => MapLogicalBytes,
+      map_wire_bytes => MapWireBytes,
+      map_payload_bytes => MapWireBytes,
+      map_send_failures => MapSendFailures,
       nearby_delivery_flushes => NearbyDeliveryFlushes,
       nearby_role_packets => NearbyRolePackets,
-      nearby_payload_bytes => NearbyPayloadBytes,
+      nearby_logical_bytes => NearbyLogicalBytes,
+      nearby_wire_bytes => NearbyWireBytes,
+      nearby_payload_bytes => NearbyWireBytes,
+      nearby_send_failures => NearbySendFailures,
       map_operations => map_router:operation_stats(),
       beam_process_count => erlang:system_info(process_count),
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
 
-record_broadcast_delivery(Type, Flushes, RolePackets, PayloadBytes) ->
+record_broadcast_delivery(Type, Flushes, RolePackets,
+                          LogicalBytes, WireBytes) ->
     try ets:update_counter(
             broadcast_delivery_metrics, Type,
-            [{2, Flushes}, {3, RolePackets}, {4, PayloadBytes}]) of
+            [{2, Flushes}, {3, RolePackets},
+             {4, LogicalBytes}, {5, WireBytes}]) of
+        _ -> ok
+    catch
+        error:badarg -> ok
+    end.
+
+record_broadcast_send_failure(Type) ->
+    record_broadcast_send_failures(Type, 1).
+
+record_broadcast_send_failures(_Type, 0) ->
+    ok;
+record_broadcast_send_failures(Type, Count) ->
+    try ets:update_counter(broadcast_delivery_metrics, Type, {6, Count}) of
         _ -> ok
     catch
         error:badarg -> ok
@@ -168,10 +213,12 @@ broadcast_delivery_stats(Type) ->
     case table_rows(broadcast_delivery_metrics) of
         Rows ->
             case lists:keyfind(Type, 1, Rows) of
-                {Type, Flushes, RolePackets, PayloadBytes} ->
-                    {Flushes, RolePackets, PayloadBytes};
+                {Type, Flushes, RolePackets,
+                 LogicalBytes, WireBytes, SendFailures} ->
+                    {Flushes, RolePackets, LogicalBytes,
+                     WireBytes, SendFailures};
                 false ->
-                    {0, 0, 0}
+                    {0, 0, 0, 0, 0}
             end
     end.
 
@@ -197,3 +244,31 @@ process_queue_length(Pid) when is_pid(Pid) ->
     end;
 process_queue_length(_Pid) ->
     undefined.
+
+socket_send_pend_stats() ->
+    lists:foldl(
+        fun(#world_channel_member{socket = Socket}, {Total, Max}) ->
+            socket_send_pend(Socket, Total, Max)
+        end,
+        {0, 0},
+        lists:append([
+            table_rows(Table)
+         || Table <- channel_server:world_member_tables()
+        ])).
+
+socket_send_pend(Socket, Total, Max) when is_port(Socket) ->
+    case catch inet:getstat(Socket, [send_pend]) of
+        {ok, [{send_pend, Bytes}]} ->
+            {Total + Bytes, erlang:max(Max, Bytes)};
+        _ ->
+            {Total, Max}
+    end;
+socket_send_pend(_Socket, Total, Max) ->
+    {Total, Max}.
+
+socket_writer_queue_stats() ->
+    Writers = [Writer
+               || Table <- channel_server:world_member_tables(),
+                  #world_channel_member{writer = Writer} <- table_rows(Table),
+                  is_pid(Writer)],
+    queue_stats(Writers).

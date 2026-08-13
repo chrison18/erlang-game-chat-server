@@ -4,6 +4,7 @@
 -export([child_spec/1,
          start_link/1,
          join/4,
+         join/5,
          leave/3,
          relocate/3,
          nearby/2,
@@ -25,7 +26,10 @@ start_link(MapId) ->
     gen_server:start_link({local, server_name(MapId)}, ?MODULE, [MapId], []).
 
 join(MapId, RoleId, RolePid, Position) ->
-    worker_call(MapId, {join, RoleId, RolePid, Position}).
+    join(MapId, RoleId, RolePid, undefined, Position).
+
+join(MapId, RoleId, RolePid, Socket, Position) ->
+    worker_call(MapId, {join, RoleId, RolePid, Socket, Position}).
 
 leave(MapId, RoleId, RolePid) ->
     worker_call(MapId, {leave, RoleId, RolePid}).
@@ -40,9 +44,9 @@ nearby(MapId, {X, Y}) ->
                                            erlang:min(99, X + 1)),
                       NearbyY <- lists:seq(erlang:max(0, Y - 1),
                                            erlang:min(99, Y + 1))],
-    lists:usort([RolePid
+    lists:usort([{RolePid, Writer}
                  || Coordinate <- Coordinates,
-                    {_StoredCoordinate, RolePid} <- ets:lookup(
+                    {_StoredCoordinate, {RolePid, Writer}} <- ets:lookup(
                         Table, Coordinate)]).
 
 operation_stats(MapId) ->
@@ -54,18 +58,34 @@ operation_stats(MapId) ->
             metrics_table(MapId))
     ]).
 
+record_operation(MapId, Operation, StartedAt) ->
+    ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
+    Table = metrics_table(MapId),
+    _ = ets:update_counter(
+        Table, Operation,
+        [{2, 1}, {3, ElapsedUs}],
+        {Operation, 0, 0, 0}),
+    _ = ets:select_replace(Table, [
+        {{Operation, '$1', '$2', '$3'},
+         [{'<', '$3', ElapsedUs}],
+         [{{Operation, '$1', '$2', ElapsedUs}}]}
+    ]),
+    ok.
+
 init([MapId]) ->
     CellTable = cell_table(MapId),
     true = ets:match_delete(CellTable, {{MapId, '_', '_'}, '_'}),
     Monitors = recover_roles(MapId, CellTable),
     {ok, #{map_id => MapId, monitors => Monitors}}.
 
-handle_call({map_request, Deadline, {join, RoleId, RolePid, Position}},
+handle_call({map_request, Deadline,
+             {join, RoleId, RolePid, Socket, Position}},
             From, State) ->
     case erlang:monotonic_time(millisecond) < Deadline of
         true ->
             handle_call(
-                {join, RoleId, RolePid, Position, Deadline}, From, State);
+                {join, RoleId, RolePid, Socket, Position, Deadline},
+                From, State);
         false -> {reply, {error, map_unavailable}, State}
     end;
 handle_call({map_request, Deadline, {leave, RoleId, RolePid}}, From, State) ->
@@ -79,7 +99,7 @@ handle_call({map_request, Deadline, Request}, From, State) ->
         false -> {reply, {error, map_unavailable}, State}
     end;
 
-handle_call({join, RoleId, RolePid, Position, Deadline}, _From,
+handle_call({join, RoleId, RolePid, Socket, Position, Deadline}, _From,
             #{map_id := MapId, monitors := Monitors} = State) ->
     StartedAt = erlang:monotonic_time(microsecond),
     Location = {MapId, Position},
@@ -105,13 +125,14 @@ handle_call({join, RoleId, RolePid, Position, Deadline}, _From,
                     end;
                 true ->
                     case channel_server:join_map(
-                             MapId, RoleId, RolePid, Deadline) of
+                             MapId, RoleId, RolePid, Socket, Deadline) of
                         {ok, {map, MapId}} ->
                             true = ets:insert(
                                 ?POSITION_TABLE, {RolePid, Location}),
                             true = ets:insert(
                                 cell_table(MapId),
-                                {cell_key(Location), RolePid}),
+                                {cell_key(Location),
+                                 {RolePid, connection_writer(Socket)}}),
                             {NewMonitors, _MonitorRef} =
                                 ensure_monitor(RolePid, Monitors),
                             operation_reply(
@@ -166,12 +187,15 @@ handle_call({relocate, RolePid, NewPosition}, _From,
             operation_reply(
                 MapId, relocate, StartedAt, {ok, NewPosition}, State);
         {true, [{RolePid, {MapId, _OldPosition} = OldLocation}]} ->
-            NewLocation = {MapId, NewPosition},
-            true = ets:delete_object(
-                cell_table(MapId), {cell_key(OldLocation), RolePid}),
-            true = ets:insert(?POSITION_TABLE, {RolePid, NewLocation}),
+            CellTable = cell_table(MapId),
+            Key = cell_key(OldLocation),
+            Writer = cell_writer(CellTable, Key, RolePid),
+            delete_cell_member(CellTable, Key, RolePid),
             true = ets:insert(
-                cell_table(MapId), {cell_key(NewLocation), RolePid}),
+                ?POSITION_TABLE, {RolePid, {MapId, NewPosition}}),
+            true = ets:insert(
+                CellTable,
+                {cell_key({MapId, NewPosition}), {RolePid, Writer}}),
             operation_reply(
                 MapId, relocate, StartedAt, {ok, NewPosition}, State)
     end;
@@ -215,7 +239,7 @@ drop_monitor(RolePid, Monitors) ->
 
 remove_role(MapId, RolePid) ->
     true = ets:match_delete(
-        cell_table(MapId), {{MapId, '_', '_'}, RolePid}),
+        cell_table(MapId), {{MapId, '_', '_'}, {RolePid, '_'}}),
     case ets:lookup(?POSITION_TABLE, RolePid) of
         [{RolePid, {MapId, _Position}}] ->
             true = ets:delete(?POSITION_TABLE, RolePid);
@@ -226,26 +250,29 @@ remove_role(MapId, RolePid) ->
 
 remove_location(MapId, RolePid, Location) ->
     true = ets:delete(?POSITION_TABLE, RolePid),
-    true = ets:delete_object(
-        cell_table(MapId), {cell_key(Location), RolePid}),
+    CellTable = cell_table(MapId),
+    delete_cell_member(CellTable, cell_key(Location), RolePid).
+
+delete_cell_member(Table, Key, RolePid) ->
+    lists:foreach(
+        fun(Member) -> ets:delete_object(Table, Member) end,
+        ets:match_object(Table, {Key, {RolePid, '_'}})),
     ok.
+
+cell_writer(Table, Key, RolePid) ->
+    case ets:match_object(Table, {Key, {RolePid, '$1'}}) of
+        [{Key, {RolePid, Writer}}] -> Writer;
+        [] -> undefined
+    end.
 
 cell_key({MapId, {X, Y}}) ->
     {MapId, X, Y}.
 
+connection_writer({_Socket, Writer}) -> Writer;
+connection_writer(_Socket) -> undefined.
+
 operation_reply(MapId, Operation, StartedAt, Reply, State) ->
-    ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
-    Table = metrics_table(MapId),
-    case ets:lookup(Table, Operation) of
-        [{Operation, Count, TotalUs, MaxUs}] ->
-            true = ets:insert(
-                Table,
-                {Operation, Count + 1, TotalUs + ElapsedUs,
-                 erlang:max(MaxUs, ElapsedUs)});
-        [] ->
-            true = ets:insert(
-                Table, {Operation, 1, ElapsedUs, ElapsedUs})
-    end,
+    record_operation(MapId, Operation, StartedAt),
     {reply, Reply, State}.
 
 table_rows(Table) ->
@@ -276,7 +303,9 @@ recover_roles(MapId, CellTable) ->
     lists:foldl(
         fun({RolePid, {RoleMapId, _Position} = Location}, Monitors)
               when RoleMapId =:= MapId ->
-            true = ets:insert(CellTable, {cell_key(Location), RolePid}),
+            true = ets:insert(
+                CellTable,
+                {cell_key(Location), {RolePid, role_server:writer(RolePid)}}),
             gen_server:cast(RolePid, {rejoin_channel, {map, MapId}}),
             {NewMonitors, _MonitorRef} = ensure_monitor(RolePid, Monitors),
             NewMonitors;

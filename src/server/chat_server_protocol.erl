@@ -22,6 +22,7 @@
          encode_map_chat_send_result/1,
          encode_map_chat_push/4,
          encode_map_chat_push_batch/1,
+         batch_sizes/1,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -88,11 +89,11 @@ decode_request(<<ProtoId:16, Data/binary>>) ->
 decode_request(_Packet) ->
     {error, {invalid_packet, 0}}.
 
-encode_login_result({ok, RoleId, {X, Y}, ChannelIds}) ->
+encode_login_result({ok, RoleId, MapId, {X, Y}, ChannelIds}) ->
     ChannelCount = length(ChannelIds),
     ChannelData = << <<ChannelId:32>> || ChannelId <- ChannelIds >>,
     <<?PROTO_LOGIN_RESULT:16, ?RESULT_SUCCESS:8, RoleId:32,
-      X:8, Y:8, ChannelCount:16, ChannelData/binary>>;
+      MapId:16, X:8, Y:8, ChannelCount:16, ChannelData/binary>>;
 encode_login_result({error, invalid_login}) ->
     <<?PROTO_LOGIN_RESULT:16, ?LOGIN_RESULT_INVALID_LOGIN:8>>;
 encode_login_result({error, already_online}) ->
@@ -159,13 +160,15 @@ encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
 
 encode_channel_push_batch(Packets) ->
-    encode_push_batch(?PROTO_CHANNEL_PUSH_BATCH, Packets).
+    maybe_compress_push_batch(
+        encode_push_batch(?PROTO_CHANNEL_PUSH_BATCH, Packets)).
 
 encode_nearby_push_batch(Packets) ->
     encode_push_batch(?PROTO_NEARBY_PUSH_BATCH, Packets).
 
 encode_map_chat_push_batch(Packets) ->
-    encode_push_batch(?PROTO_MAP_CHAT_PUSH_BATCH, Packets).
+    maybe_compress_push_batch(
+        encode_push_batch(?PROTO_MAP_CHAT_PUSH_BATCH, Packets)).
 
 encode_push_batch(ProtoId, Packets) ->
     PacketData = [<<(byte_size(Packet)):32, Packet/binary>>
@@ -174,6 +177,30 @@ encode_push_batch(ProtoId, Packets) ->
         <<ProtoId:16, (length(Packets)):16>>,
         PacketData
     ]).
+
+maybe_compress_push_batch(Packet) when byte_size(Packet) =< ?MAX_BATCH_BYTES ->
+    try zlib:compress(Packet) of
+        Compressed ->
+            Envelope = <<?PROTO_COMPRESSED_PUSH_BATCH:16,
+                         (byte_size(Packet)):32,
+                         (byte_size(Compressed)):32,
+                         Compressed/binary>>,
+            case byte_size(Envelope) < byte_size(Packet) of
+                true -> Envelope;
+                false -> Packet
+            end
+    catch
+        _Class:_Reason -> Packet
+    end;
+maybe_compress_push_batch(Packet) ->
+    Packet.
+
+batch_sizes(<<?PROTO_COMPRESSED_PUSH_BATCH:16, LogicalBytes:32,
+              _CompressedBytes:32, CompressedData/binary>>) ->
+    {LogicalBytes, 10 + byte_size(CompressedData)};
+batch_sizes(Packet) ->
+    Size = byte_size(Packet),
+    {Size, Size}.
 
 encode_private_send_result({ok, TargetRoleName}) ->
     encode_private_send_result(?RESULT_SUCCESS, TargetRoleName);
