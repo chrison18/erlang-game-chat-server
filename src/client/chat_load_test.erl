@@ -1,5 +1,7 @@
 -module(chat_load_test).
 
+%% 批量客户端控制入口。异步命令返回 ok 仅表示已投递给 chat_client。
+
 -export([start/2,
          start_map/2,
          start_observer/0,
@@ -31,6 +33,7 @@ start(StartId, EndId, LoadMode)
        is_integer(EndId), EndId >= StartId ->
     case existing_client(StartId, EndId) of
         none ->
+            %% 整段 ClientId 必须空闲，避免一批压测混入已有客户端。
             Host = application:get_env(chat, client_host, ?DEFAULT_HOST),
             Port = application:get_env(chat, port, ?DEFAULT_PORT),
             start_clients(StartId, EndId, Host, Port,
@@ -144,6 +147,7 @@ start_clients(ClientId, EndId, _Host, _Port, _LoadConfig, Count)
     {ok, Count};
 start_clients(ClientId, EndId, Host, Port,
               {LoadMode, StartId, EndId} = LoadConfig, Count) ->
+    %% 串行启动便于准确返回首个失败 ClientId；已启动客户端按约定保留。
     ClientMode = case LoadMode of
         normal -> {normal, ClientId, StartId, EndId};
         map_load -> map_load

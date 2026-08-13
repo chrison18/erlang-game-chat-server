@@ -1,5 +1,7 @@
 -module(chat_full_chain_check).
 
+%% 真实 TCP 全链路检查：按业务流、批量边界、故障恢复和监督树重启顺序执行。
+
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
@@ -20,6 +22,7 @@ run() ->
     io:format("full_chain_check: ok~n").
 
 check(Port) ->
+    %% 前半段复用 Alice/Bob 验证在线状态；最后再验证断线清理和全树恢复。
     {Alice, AliceId, AliceChannels} = login(Port, <<"alice">>, <<"pw">>),
     {Bob, BobId, _BobChannels} = login(Port, <<"bob">>, <<"pw">>),
     check_initial_channels(AliceChannels),
@@ -170,6 +173,7 @@ check_map_flow(Alice, AliceId, Bob, BobId) ->
     BobRolePid.
 
 check_multi_map_flow(Alice, AliceId, Bob, BobId) ->
+    %% 覆盖单地图归属、跨地图隔离、第三张地图和批内消息顺序。
     BobRolePid = role_pid(<<"bob">>),
     send(Alice, chat_client_protocol:encode_map_join(99)),
     {map_join_result, {error, invalid_map, 99}} = recv(Alice),
@@ -251,6 +255,7 @@ check_multi_map_flow(Alice, AliceId, Bob, BobId) ->
     {ok, {1, {0, 0}}} = map_location(BobRolePid).
 
 check_map_channel_unavailable(Port, Alice, AliceId, Bob, BobId) ->
+    %% 地图频道停机期间，失败请求不得部分修改 Role、频道或地图 ETS。
     MapPid = whereis(map_router),
     AliceRolePid = role_pid(<<"alice">>),
     BobRolePid = role_pid(<<"bob">>),
@@ -320,6 +325,7 @@ check_map_channel_recovery(Alice, AliceId, Bob, BobId) ->
         Bob, 1, AliceId, <<"alice">>, <<"map-after-restart">>).
 
 check_map_channel_timeout(Bob) ->
+    %% 暂停频道超过 deadline 后恢复，验证旧 join 不会迟到生效。
     BobRolePid = role_pid(<<"bob">>),
     send(Bob, chat_client_protocol:encode_map_leave()),
     {map_leave_result, {ok, 1}} = recv(Bob),
@@ -356,6 +362,7 @@ check_map_channel_timeout(Bob) ->
     true = is_process_alive(role_pid(<<"bob">>)).
 
 check_map_worker_recovery(Alice, AliceId, Bob, BobId) ->
+    %% 单地图 Worker 重启应从共享位置 ETS 恢复格子、monitor 和频道成员。
     AliceRolePid = role_pid(<<"alice">>),
     BobRolePid = role_pid(<<"bob">>),
     Router = whereis(map_router),
@@ -381,6 +388,7 @@ check_map_worker_recovery(Alice, AliceId, Bob, BobId) ->
     true = AliceId =/= BobId.
 
 check_map_worker_timeout() ->
+    %% mailbox 中过期的地图请求必须返回失败且不留下任何状态。
     Worker = whereis(map_worker_3),
     RolePid = spawn(fun() -> receive stop -> ok end end),
     RoleId = 999999,
@@ -398,6 +406,7 @@ check_map_worker_timeout() ->
     RolePid ! stop.
 
 check_pending_join_recovery() ->
+    %% 模拟 Worker 在频道加入后、位置提交前崩溃，重启时应回滚 pending。
     Worker = whereis(map_worker_3),
     RolePid = spawn(fun() -> receive stop -> ok end end),
     RoleId = 999998,
@@ -612,6 +621,7 @@ check_private_flow(Alice, AliceId, Bob, _BobId) ->
      {error, target_offline, <<"missing">>}} = recv(Alice).
 
 check_role_packet_batch(Alice, AliceId) ->
+    %% 三种批包都必须保持顺序，并拒绝错误内层类型或长度。
     [#online_role{role_pid = AliceRolePid}] =
         ets:lookup(online_roles, <<"alice">>),
     Packets = [
@@ -874,6 +884,7 @@ check_map_load_client() ->
     wait_until(fun() -> ets:info(online_roles, size) =:= 3 end).
 
 check_main_restart(Alice) ->
+    %% main 位于 rest_for_one 上游，重启时依赖它的频道、Role 和 listener 一并重建。
     OldMap = whereis(map_router),
     OldMain = whereis(main_channel_server),
     OldChannelSup = whereis(channel_sup),
@@ -898,6 +909,7 @@ check_main_restart(Alice) ->
     check_world_member_shards(0).
 
 check_map_restart(Port) ->
+    %% Router 是地图 ETS owner；重启后下游连接必须关闭，不能继续持有旧状态。
     {Socket, _RoleId, _Channels} = login(Port, <<"before_map_restart">>, <<"pw">>),
     OldMap = whereis(map_router),
     OldMain = whereis(main_channel_server),

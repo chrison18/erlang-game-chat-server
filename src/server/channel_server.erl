@@ -1,6 +1,9 @@
 -module(channel_server).
 -behaviour(gen_server).
 
+%% 公共频道和地图内部频道共用的成员与批量广播进程。
+%% main 频道只维护成员分片，实际广播由 world_broadcast_worker 完成。
+
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
@@ -127,6 +130,7 @@ init([ChannelId, Type]) ->
         ?CHANNEL_TYPE_MAIN ->
             {ok, State};
         ?CHANNEL_TYPE_PUBLIC ->
+            %% 普通/地图频道重启后由在线 Role 的本地状态反向恢复成员。
             {ok, State, {continue, recover_members}}
     end.
 
@@ -142,6 +146,7 @@ handle_continue(flush_batch, State) ->
     {noreply, flush_batch(full, State)}.
 
 handle_call({channel_request, Deadline, Request}, From, State) ->
+    %% caller 超时不会撤销请求，出队前检查 deadline 以拒绝迟到副作用。
     case erlang:monotonic_time(millisecond) < Deadline of
         true -> handle_call(Request, From, State);
         false -> {reply, {error, channel_unavailable}, State}
@@ -157,6 +162,7 @@ handle_call({join, RoleId, RolePid}, _From,
         true ->
             {reply, {error, already_joined}, State};
         false ->
+            %% 新成员从当前 batch_size 开始，只接收加入之后进入本批的消息。
             MonitorRef = erlang:monitor(process, RolePid),
             Member = #channel_member{
                 role_pid = RolePid,
@@ -179,6 +185,7 @@ handle_call({leave, RoleId}, _From,
     case maps:take(RoleId, Members) of
         {#channel_member{monitor_ref = MonitorRef} = Member,
          RemainingMembers} ->
+            %% 只补发离开者应收的当前批次后缀，不打断其他成员的合批。
             ok = send_pending(State, Member),
             true = erlang:demonitor(MonitorRef, [flush]),
             ok = remove_world_member(ChannelType, RoleId),
@@ -273,6 +280,7 @@ encode_push(ChannelId, RoleId, RoleName, Content) ->
 enqueue(Packet, #channel_state{packets = Packets,
                                batch_size = BatchSize,
                                flush_ref = undefined} = State) ->
+    %% 每批首条消息启动 timer；满 256 条时由 continue 立即刷批。
     Ref = erlang:start_timer(?BATCH_WINDOW_MS, self(), flush_batch),
     NewSize = BatchSize + 1,
     {State#channel_state{packets = [Packet | Packets],
@@ -296,6 +304,7 @@ flush_batch(Reason,
                            batch_size = BatchSize,
                            batch_generation = BatchGeneration} = State) ->
     cancel_flush_timer(State),
+    %% generation 每次全批发送后递增，使跨批加入/离开的偏移不会串批。
     OrderedPackets = lists:reverse(Packets),
     {_, RolePackets, PayloadBytes} = maps:fold(
         fun(_RoleId, Member, BatchAcc) ->
@@ -321,6 +330,7 @@ send_batch(ChannelId, BatchGeneration, _BatchSize, OrderedPackets,
                            batch_generation = MemberGeneration,
                            batch_start = MemberStart},
            {BatchPackets, RolePackets, PayloadBytes}) ->
+    %% 稳定成员从 0 开始；本批中途加入者只取自己 batch_start 后的消息。
     BatchStart = case MemberGeneration =:= BatchGeneration of
         true -> MemberStart;
         false -> 0
@@ -411,6 +421,7 @@ channel_call(ChannelId, Request, Deadline) ->
     end.
 
 channel_call_pid(ChannelPid, Request, Deadline) ->
+    %% 调用固定在开始时解析的 PID，重启后的新实例不会接到这条旧请求。
     RemainingMs = erlang:max(
         0, Deadline - erlang:monotonic_time(millisecond)),
     try gen_server:call(

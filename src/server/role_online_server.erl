@@ -1,6 +1,8 @@
 -module(role_online_server).
 -behaviour(gen_server).
 
+%% 保存账号与在线 Role 索引，并通过 monitor 自动清理断开的在线记录。
+
 -include("chat_record.hrl").
 
 -export([start_link/0, login/3]).
@@ -49,6 +51,7 @@ handle_info(_Info, State) ->
 
 login_role(RolePid, RoleName, Password,
            #{next_role_id := NextRoleId} = State) ->
+    %% 首次登录创建账号；已有账号只校验密码和单点在线约束。
     case ets:lookup(role_accounts, RoleName) of
         [] ->
             true = ets:insert(role_accounts, #role_account{

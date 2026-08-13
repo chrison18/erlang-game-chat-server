@@ -1,11 +1,14 @@
 -module(chat_metrics).
 
+%% 汇总进程邮箱、ETS 计数、批量投递和地图操作耗时，供压测采样。
+
 -include("chat_record.hrl").
 
 -export([snapshot/0, online_clients/0, print_online_clients/0,
          record_broadcast_delivery/4]).
 
 snapshot() ->
+    %% snapshot 只读取当前状态；缺失的监督者或 ETS 会按空数据处理。
     {RoleCount, RoleQueueTotal, RoleQueueMax} =
         queue_stats(child_pids(role_sup, role_server)),
     {ChannelCount, ChannelQueueTotal, ChannelQueueMax} =

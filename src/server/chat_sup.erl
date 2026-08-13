@@ -1,6 +1,8 @@
 -module(chat_sup).
 -behaviour(supervisor).
 
+%% 服务端顶层监督树。子进程顺序同时表达状态依赖关系。
+
 -export([start_link/0]).
 -export([init/1]).
 
@@ -8,6 +10,7 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    %% 上游状态 owner 重启时，rest_for_one 会重建依赖它的下游进程。
     SupFlags = #{strategy => rest_for_one,
                  intensity => 5,
                  period => 10},

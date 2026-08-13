@@ -1,6 +1,8 @@
 -module(chat_listener).
 -behaviour(gen_server).
 
+%% 只负责 accept 和 Socket 所有权交接，协议处理由 role_server 完成。
+
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2, terminate/2]).
@@ -45,6 +47,7 @@ terminate(_Reason, #{listen_socket := ListenSocket}) ->
 handoff_socket(Socket) ->
     case role_sup:start_role() of
         {ok, RolePid} ->
+            %% 必须先转移 controlling process，再通知 Role 开启 active 模式。
             case gen_tcp:controlling_process(Socket, RolePid) of
                 ok ->
                     RolePid ! {socket_ready, Socket},

@@ -1,5 +1,7 @@
 -module(chat_client_protocol).
 
+%% 客户端协议边界：编码请求，并严格解码服务端结果与批量推送。
+
 -include("chat_protocol.hrl").
 
 -export([encode_login/2,
@@ -222,6 +224,7 @@ decode_push_batch(BatchType, _MessageType, 0, <<>>, Messages) ->
 decode_push_batch(BatchType, MessageType, Count,
                   <<PacketLength:32, Data/binary>>, Messages)
   when Count > 0 ->
+    %% 批类型不仅限制数量和长度，也限制每个内层包允许出现的消息类型。
     case Data of
         <<Packet:PacketLength/binary, RemainingData/binary>> ->
             case decode_packet(Packet) of

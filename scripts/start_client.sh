@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# 大量 TCP 客户端需要高 nofile 上限；失败时由 set -e 直接停止启动。
 ulimit -c unlimited
 ulimit -SHn 65535
 

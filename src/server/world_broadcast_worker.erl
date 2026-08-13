@@ -1,6 +1,8 @@
 -module(world_broadcast_worker).
 -behaviour(gen_server).
 
+%% 世界频道按接收者分成 8 个 Worker；每个 Worker 独立组批并扫描自己的 ETS。
+
 -include("chat_record.hrl").
 
 -export([start_link/1, send/3, worker_count/0]).
@@ -21,6 +23,7 @@ send(RoleId, RoleName, Content) ->
         true ->
             case worker_pids() of
                 {ok, Workers} ->
+                    %% 同一消息发给全部分片，每个 Worker 只投递自己的成员。
                     Packet = chat_server_protocol:encode_channel_push(
                         ?WORLD_CHANNEL_ID, RoleId, RoleName, Content),
                     lists:foreach(
@@ -76,6 +79,7 @@ worker_pids() ->
 enqueue(Packet, #{packets := Packets,
                   batch_size := BatchSize,
                   flush_ref := undefined} = State) ->
+    %% 每批首条消息启动一次 timer，满 256 条则由 continue 提前刷批。
     Ref = make_ref(),
     _ = erlang:send_after(?BATCH_WINDOW_MS, self(), {flush_batch, Ref}),
     NewSize = BatchSize + 1,
@@ -95,6 +99,7 @@ flush_batch(#{worker_index := WorkerIndex, packets := Packets} = State) ->
 broadcast([], _WorkerIndex) ->
     ok;
 broadcast(Packets, WorkerIndex) ->
+    %% 整批只编码一次，同一分片内每个 Role 只收到一个 cast。
     BatchPacket = chat_server_protocol:encode_channel_push_batch(Packets),
     MemberTable = lists:nth(
         WorkerIndex, channel_server:world_member_tables()),

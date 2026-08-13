@@ -1,6 +1,8 @@
 -module(map_worker_sup).
 -behaviour(supervisor).
 
+%% 每张固定地图一个写 Worker，不同地图的状态修改可以并行。
+
 -export([start_link/0]).
 -export([init/1]).
 

@@ -1,6 +1,9 @@
 -module(map_router).
 -behaviour(gen_server).
 
+%% 地图 API 与共享 ETS owner。正常请求直接定位对应 map_worker，
+%% Router 进程本身不转发业务消息，避免重新形成全地图串行点。
+
 -include("chat_protocol.hrl").
 
 -export([start_link/0,
@@ -29,6 +32,7 @@ default_map_id() ->
     ?DEFAULT_MAP_ID.
 
 join(RoleId, RolePid, MapId, Position) ->
+    %% 入口只做全局校验；单地图的一致性修改由对应 Worker 串行完成。
     case valid_map(MapId) of
         true ->
             recover_join_result(
@@ -56,6 +60,7 @@ relocate(RolePid, NewPosition) ->
     end.
 
 nearby({MapId, Position}) ->
+    %% nearby 是只读快照，直接并发查 ETS，不进入地图写 Worker mailbox。
     case valid_map(MapId) andalso valid_position(Position) of
         true -> {ok, map_worker:nearby(MapId, Position)};
         false -> {error, not_in_map}
@@ -90,6 +95,7 @@ valid_position(_Position) ->
     false.
 
 init([]) ->
+    %% 位置反向索引保证一个 Role 只有一个归属；格子表按地图拆分。
     ?POSITION_TABLE = ets:new(?POSITION_TABLE, [
         named_table,
         set,
@@ -141,6 +147,7 @@ merge_operation_stats(MapStats, Acc) ->
         MapStats).
 
 recover_join_result(MapId, Position, RolePid, {error, map_unavailable}) ->
+    %% call 失败不等于请求未执行；用 ETS 真相识别已经完成的操作。
     case location(RolePid) of
         {ok, {MapId, Position} = Location} -> {ok, Location};
         _ -> {error, map_unavailable}

@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EBIN_DIR="$PROJECT_DIR/ebin"
 
+# 项目不依赖 rebar3，直接编译服务端、客户端和全链路检查模块。
 mkdir -p "$EBIN_DIR"
 rm -f "$EBIN_DIR"/*.beam
 

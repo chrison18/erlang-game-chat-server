@@ -1,6 +1,9 @@
 -module(nearby_broadcast_worker).
 -behaviour(gen_server).
 
+%% 周围聊天按地图运行，并按发送者所在格子分别组批。
+%% 刷批时再按接收 Role 合并消息，减少 Role mailbox 和 TCP send 次数。
+
 -export([start_link/1, send/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2]).
@@ -16,6 +19,7 @@ start_link(MapId) ->
 send(MapId, Position, Packet, Targets) ->
     case whereis(worker_name(MapId)) of
         undefined ->
+            %% Worker 重启窗口仍直接投递单消息，保持周围聊天可用。
             BatchPacket = chat_server_protocol:encode_nearby_push_batch([Packet]),
             lists:foreach(
                 fun(TargetPid) ->
@@ -69,6 +73,7 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 enqueue(Position, Item, Batches) ->
+    %% 不同来源格子使用独立 timer，避免一个热格推动其他格子提前发送。
     case maps:find(Position, Batches) of
         error ->
             Ref = make_ref(),
@@ -96,6 +101,7 @@ flush_batch(Position, #{map_id := MapId, batches := Batches} = State) ->
     end.
 
 broadcast(Items) ->
+    %% 先把“消息 -> 多个目标”转置为“目标 -> 该目标应收的消息列表”。
     TargetPackets = lists:foldl(
         fun({Packet, Targets}, Acc) ->
             lists:foldl(
@@ -113,6 +119,7 @@ broadcast(Items) ->
         fun(TargetPid, ReversedPackets,
             {BatchPackets, PacketCount, ByteCount}) ->
             Packets = lists:reverse(ReversedPackets),
+            %% 目标列表完全相同时复用已编码批包，避免重复构造相同 binary。
             {BatchPacket, NewBatchPackets} = batch_packet(
                 Packets, BatchPackets),
             gen_server:cast(TargetPid, {push_batch, BatchPacket}),

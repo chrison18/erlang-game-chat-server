@@ -1,6 +1,9 @@
 -module(role_server).
 -behaviour(gen_server).
 
+%% 一条 TCP 连接对应一个 Role 进程：解码请求、调用业务进程并维护已确认状态。
+%% 频道、地图和位置只在下游操作成功后写入进程字典。
+
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
@@ -30,6 +33,7 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 handle_info({socket_ready, Socket}, #{socket := undefined} = State) ->
+    %% listener 完成 Socket 所有权交接后，Role 才切到 active 模式接收 TCP 消息。
     case inet:setopts(Socket, [{active, true}]) of
         ok ->
             {noreply, State#{socket := Socket}};
@@ -58,6 +62,7 @@ terminate(_Reason, #{socket := Socket}) ->
     gen_tcp:close(Socket).
 
 handle_packet(Packet, Socket) ->
+    %% 协议层只负责解析；除登录外的请求统一经过登录态检查再进入业务分支。
     case chat_server_protocol:decode_request(Packet) of
         {ok, {login, RoleName, Password}} ->
             handle_login(Socket, RoleName, Password);
@@ -131,6 +136,7 @@ handle_business_request(list_channels, Socket, _RoleId) ->
     send_packet(Socket,
         chat_server_protocol:encode_channel_list_result(ChannelList));
 handle_business_request({join_channel, ChannelId}, Socket, RoleId) ->
+    %% 频道进程确认成功后才更新 Role 的本地成员缓存。
     ProtocolResult = case channel_server:join(ChannelId, RoleId, self()) of
         {ok, ChannelId} = Result ->
             put(channel_ids, maps:put(ChannelId, true, get(channel_ids))),
@@ -186,6 +192,7 @@ handle_business_request({send_nearby, Content}, Socket, RoleId) ->
     send_packet(Socket, chat_server_protocol:encode_nearby_send_result(Result));
 handle_business_request({join_map, MapId}, Socket, RoleId) ->
     SpawnPosition = map_router:random_position(),
+    %% map_worker 同时提交频道成员和双 ETS 后，Role 才接受新地图与坐标。
     ProtocolResult = case map_router:join(
                               RoleId, self(), MapId, SpawnPosition) of
         {ok, {MapId, Position}} ->
@@ -202,6 +209,7 @@ handle_business_request({join_map, MapId}, Socket, RoleId) ->
     send_packet(Socket,
         chat_server_protocol:encode_map_join_result(ProtocolResult));
 handle_business_request(leave_map, Socket, RoleId) ->
+    %% 地图层确认清理完成后再擦除本地状态，失败时仍保留原归属。
     ProtocolResult = case map_router:leave(RoleId, self()) of
         {ok, _MapId} = Result ->
             erase(map_id),
@@ -242,6 +250,7 @@ handle_login(Socket, RoleName, Password) ->
 complete_login(Socket, RoleId, RoleName) ->
     InitialPosition = map_router:random_position(),
     InitialMapId = map_router:default_map_id(),
+    %% 登录初始化顺序：进入地图 -> 加入初始频道 -> 发布 Role 本地状态和成功响应。
     case map_router:join(
              RoleId, self(), InitialMapId, InitialPosition) of
         {ok, {InitialMapId, InitialPosition}} ->
@@ -257,6 +266,7 @@ complete_login(Socket, RoleId, RoleName) ->
                         chat_server_protocol:encode_login_result(
                             {ok, RoleId, InitialPosition, ChannelIds}));
                 {error, _Reason} ->
+                    %% 半初始化连接直接关闭，monitor 会清理已登记的在线与地图状态。
                     reject_unavailable_login(Socket)
             end;
         {error, _Reason} ->
@@ -293,6 +303,7 @@ join_channels([ChannelId | Rest], RoleId) ->
     end.
 
 maybe_rejoin_channel({map, MapId}) ->
+    %% 频道或地图 Worker 重启时，只按 Role 当前仍持有的成员真相恢复。
     case get(map_id) of
         MapId ->
             _ = channel_server:join_map(MapId, get(role_id), self()),
@@ -353,6 +364,7 @@ send_nearby_message(RoleId, RoleName, Content) ->
             {error, not_in_map};
         MapId ->
             Position = get(position),
+            %% 先取九宫格目标快照，再交给对应地图 Worker 按来源格子组批。
             {ok, Targets} = map_router:nearby({MapId, Position}),
             {X, Y} = Position,
             Packet = chat_server_protocol:encode_nearby_push(
@@ -387,6 +399,7 @@ teleport(Target, Position) ->
     end.
 
 relocate(OldPosition, NewPosition) ->
+    %% ETS 双索引更新成功后才更新 Role 缓存；不可用错误保留旧坐标。
     case map_router:relocate(self(), NewPosition) of
         {ok, NewPosition} ->
             put(position, NewPosition),

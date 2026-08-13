@@ -1,5 +1,7 @@
 -module(chat_server_protocol).
 
+%% 服务端协议边界：把 TCP 二进制请求解成业务项，并把结果编码回二进制。
+
 -include("chat_protocol.hrl").
 
 -export([decode_request/1,
@@ -168,6 +170,7 @@ encode_map_chat_push_batch(Packets) ->
     encode_push_batch(?PROTO_MAP_CHAT_PUSH_BATCH, Packets).
 
 encode_push_batch(ProtoId, Packets) ->
+    %% 每个内层包带 32 位长度，客户端可严格检查数量、边界和消息类型。
     PacketData = [<<(byte_size(Packet)):32, Packet/binary>>
                   || Packet <- Packets],
     iolist_to_binary([

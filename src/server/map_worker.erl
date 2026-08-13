@@ -1,6 +1,9 @@
 -module(map_worker).
 -behaviour(gen_server).
 
+%% 单张地图的写入 owner：串行维护位置、格子索引、频道成员与 Role monitor。
+%% 只读 nearby 不经过本进程，直接读取 Router 持有的 ETS。
+
 -export([child_spec/1,
          start_link/1,
          join/4,
@@ -34,6 +37,7 @@ relocate(MapId, RolePid, NewPosition) ->
     worker_call(MapId, {relocate, RolePid, NewPosition}).
 
 nearby(MapId, {X, Y}) ->
+    %% 九宫格最多查询 9 个坐标，usort 同时去重同一 Role。
     Table = cell_table(MapId),
     Coordinates = [{MapId, NearbyX, NearbyY}
                    || NearbyX <- lists:seq(erlang:max(0, X - 1),
@@ -55,6 +59,7 @@ operation_stats(MapId) ->
     ]).
 
 init([MapId]) ->
+    %% Worker 可独立重启；共享位置表是恢复格子索引和 monitor 的真相。
     CellTable = cell_table(MapId),
     true = ets:match_delete(CellTable, {{MapId, '_', '_'}, '_'}),
     Monitors = recover_roles(MapId, CellTable),
@@ -62,6 +67,7 @@ init([MapId]) ->
 
 handle_call({map_request, Deadline, {join, RoleId, RolePid, Position}},
             From, State) ->
+    %% caller 超时不会撤销 mailbox 中的请求，执行前检查 deadline 防止迟到副作用。
     case erlang:monotonic_time(millisecond) < Deadline of
         true ->
             handle_call(
@@ -88,6 +94,7 @@ handle_call({join, RoleId, RolePid, Position, Deadline}, _From,
             operation_reply(
                 MapId, join, StartedAt, {error, invalid_position}, State);
         true ->
+            %% pending 先占住唯一位置槽，闭合频道 join 期间的 Worker 崩溃窗口。
             Pending = {pending, MapId, Position, RoleId},
             case ets:insert_new(?POSITION_TABLE, {RolePid, Pending}) of
                 false ->
@@ -107,6 +114,7 @@ handle_call({join, RoleId, RolePid, Position, Deadline}, _From,
                     case channel_server:join_map(
                              MapId, RoleId, RolePid, Deadline) of
                         {ok, {map, MapId}} ->
+                            %% 频道加入成功后，才把 pending 提交为正式位置和格子索引。
                             true = ets:insert(
                                 ?POSITION_TABLE, {RolePid, Location}),
                             true = ets:insert(
@@ -118,6 +126,7 @@ handle_call({join, RoleId, RolePid, Position, Deadline}, _From,
                                 MapId, join, StartedAt, {ok, Location},
                                 State#{monitors := NewMonitors});
                         {error, channel_unavailable} ->
+                            %% 下游频道失败时回滚占位，不留下半完成的地图成员。
                             true = ets:delete(?POSITION_TABLE, RolePid),
                             operation_reply(
                                 MapId, join, StartedAt,
@@ -133,6 +142,7 @@ handle_call({leave, RoleId, RolePid, Deadline}, _From,
             operation_reply(
                 MapId, leave, StartedAt, {error, not_in_map}, State);
         [{RolePid, {MapId, _Position} = Location}] ->
+            %% 先确认频道离开，再删除地图索引；失败时两边都保持原状态。
             case channel_server:leave_map(MapId, RoleId, Deadline) of
                 {ok, {map, MapId}} ->
                     ok = remove_location(MapId, RolePid, Location),
@@ -166,6 +176,7 @@ handle_call({relocate, RolePid, NewPosition}, _From,
             operation_reply(
                 MapId, relocate, StartedAt, {ok, NewPosition}, State);
         {true, [{RolePid, {MapId, _OldPosition} = OldLocation}]} ->
+            %% 本 Worker 串行更新双索引，读者最多观察到一次短暂快照差异。
             NewLocation = {MapId, NewPosition},
             true = ets:delete_object(
                 cell_table(MapId), {cell_key(OldLocation), RolePid}),
@@ -273,6 +284,7 @@ worker_call(MapId, Request) ->
     end.
 
 recover_roles(MapId, CellTable) ->
+    %% 正式位置恢复格子、频道和 monitor；遗留 pending 表示 join 未提交，需回滚。
     lists:foldl(
         fun({RolePid, {RoleMapId, _Position} = Location}, Monitors)
               when RoleMapId =:= MapId ->

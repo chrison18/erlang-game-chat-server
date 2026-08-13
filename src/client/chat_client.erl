@@ -1,6 +1,8 @@
 -module(chat_client).
 -behaviour(gen_server).
 
+%% 单个压测/手工客户端：发送命令、解码响应并保存服务端已经确认的本地缓存。
+
 -include("chat_protocol.hrl").
 
 -export([start_link/5]).
@@ -49,6 +51,7 @@ handle_call(Request, _From, State) ->
     {stop, {unsupported_call, Request}, State}.
 
 handle_cast(list_channels, State) ->
+    %% 外部 API 使用 cast，只表示命令进入客户端进程，不代表服务端业务成功。
     {noreply, do_list_channels(State)};
 handle_cast({join_channel, ChannelId}, State) ->
     {noreply, do_join_channel(ChannelId, State)};
@@ -244,6 +247,7 @@ normalize_text(Text) ->
     end.
 
 handle_server_packet(Packet, State) ->
+    %% 批包先在协议层完整校验，再逐条交给与单包相同的处理函数。
     case chat_client_protocol:decode_packet(Packet) of
         {ok, {channel_push_batch, Messages}} ->
             handle_channel_push_batch(Messages, State);
@@ -267,6 +271,7 @@ handle_server_packet(Packet, State) ->
 
 handle_response({login_result,
                  {ok, _RoleId, Position, ChannelIds} = Result}, State) ->
+    %% 地图、坐标和频道缓存只取服务端成功响应，不在发送请求时提前修改。
     LoggedInState = remember_channels(
         ChannelIds, State#{map_id := ?DEFAULT_MAP_ID,
                            position := Position}),
@@ -402,6 +407,7 @@ start_mode_after_login(#{mode := normal} = State) ->
     schedule_next_action(),
     State;
 start_mode_after_login(#{mode := map_load} = State) ->
+    %% map_load 先等待随机传送成功，再启动周期动作，避免初始请求重叠。
     do_teleport(rand:uniform(?MAP_SIZE) - 1,
                 rand:uniform(?MAP_SIZE) - 1,
                 State);
@@ -448,6 +454,7 @@ remember_channels(_ChannelIds, State) ->
     State.
 
 do_auto_action(Content, State) ->
+    %% normal 模式每秒等概率执行七类业务动作。
     case rand:uniform(7) of
         1 -> do_send_channel(1, Content, State);
         2 -> auto_private(Content, State);
@@ -478,6 +485,7 @@ auto_private(Content, State) ->
 auto_switch_map(#{map_id := undefined} = State) ->
     do_join_map(random_member(?MAP_IDS), State);
 auto_switch_map(#{map_id := MapId} = State) ->
+    %% 切图沿用公开协议语义：先发 leave，再发目标地图 join。
     TargetMapId = random_member(lists:delete(MapId, ?MAP_IDS)),
     do_join_map(TargetMapId, do_leave_map(State)).
 

@@ -1,7 +1,8 @@
 -ifndef(CHAT_PROTOCOL_HRL).
 -define(CHAT_PROTOCOL_HRL, true).
 
-%% Protocol identifiers shared by the server and client.
+%% 客户端与服务端共享的协议号、结果码和地图常量。
+%% 请求、结果和服务端推送按业务段连续编号，编解码必须与这里保持一致。
 -define(PROTO_LOGIN_REQUEST, 1001).
 -define(PROTO_LOGIN_RESULT, 1002).
 -define(PROTO_CHANNEL_LIST_REQUEST, 2001).
