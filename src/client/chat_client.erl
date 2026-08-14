@@ -247,14 +247,10 @@ normalize_text(Text) ->
     end.
 
 handle_server_packet(Packet, State) ->
-    %% 批包先在协议层完整校验，再逐条交给与单包相同的处理函数。
+    %% 公共频道批包先在协议层完整校验，再逐条交给单包处理函数。
     case chat_client_protocol:decode_packet(Packet) of
         {ok, {channel_push_batch, Messages}} ->
             handle_channel_push_batch(Messages, State);
-        {ok, {map_chat_push_batch, Messages}} ->
-            handle_map_chat_push_batch(Messages, State);
-        {ok, {nearby_push_batch, Messages}} ->
-            handle_nearby_push_batch(Messages, State);
         {ok, {channel_push, Message}} ->
             handle_channel_push(Message, State);
         {ok, {private_push, Message}} ->
@@ -382,12 +378,6 @@ handle_map_chat_push(_Message, State) ->
 
 handle_channel_push_batch(Messages, State) ->
     lists:foldl(fun handle_channel_push/2, State, Messages).
-
-handle_nearby_push_batch(Messages, State) ->
-    lists:foldl(fun handle_nearby_push/2, State, Messages).
-
-handle_map_chat_push_batch(Messages, State) ->
-    lists:foldl(fun handle_map_chat_push/2, State, Messages).
 
 handle_invalid_packet(Reason,
                       #{mode := observer,

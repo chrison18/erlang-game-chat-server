@@ -18,12 +18,10 @@
          encode_teleport_result/1,
          encode_nearby_send_result/1,
          encode_nearby_push/5,
-         encode_nearby_push_batch/1,
          encode_map_join_result/1,
          encode_map_leave_result/1,
          encode_map_chat_send_result/1,
          encode_map_chat_push/4,
-         encode_map_chat_push_batch/1,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -162,12 +160,6 @@ encode_channel_push(ChannelId, SenderRoleId, SenderRoleName, Content) ->
 
 encode_channel_push_batch(Packets) ->
     encode_push_batch(?PROTO_CHANNEL_PUSH_BATCH, Packets).
-
-encode_nearby_push_batch(Packets) ->
-    encode_push_batch(?PROTO_NEARBY_PUSH_BATCH, Packets).
-
-encode_map_chat_push_batch(Packets) ->
-    encode_push_batch(?PROTO_MAP_CHAT_PUSH_BATCH, Packets).
 
 encode_push_batch(ProtoId, Packets) ->
     %% 每个内层包带 32 位长度，客户端可严格检查数量、边界和消息类型。

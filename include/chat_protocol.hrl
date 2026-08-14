@@ -32,8 +32,6 @@
 -define(PROTO_MAP_CHAT_SEND_REQUEST, 4012).
 -define(PROTO_MAP_CHAT_SEND_RESULT, 4013).
 -define(PROTO_MAP_CHAT_PUSH, 4014).
--define(PROTO_MAP_CHAT_PUSH_BATCH, 4015).
--define(PROTO_NEARBY_PUSH_BATCH, 4016).
 -define(PROTO_ERROR, 9001).
 
 -define(RESULT_SUCCESS, 0).
@@ -91,7 +89,7 @@
 -define(CHANNEL_TYPE_MAIN, 1).
 -define(CHANNEL_TYPE_PUBLIC, 2).
 
--define(MAP_IDS, [1, 2, 3]).
+-define(MAP_IDS, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]).
 -define(DEFAULT_MAP_ID, 1).
 -define(MAP_SIZE, 100).
 

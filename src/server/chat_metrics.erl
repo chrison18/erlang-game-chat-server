@@ -1,6 +1,6 @@
 -module(chat_metrics).
 
-%% 汇总进程邮箱、ETS 计数、批量投递和地图操作耗时，供压测采样。
+%% 汇总进程邮箱、ETS 计数和地图操作耗时，供采样。
 
 -include("chat_record.hrl").
 
@@ -14,24 +14,16 @@ snapshot() ->
     {ChannelCount, ChannelQueueTotal, ChannelQueueMax} =
         queue_stats(child_pids(chat_sup, channel_server) ++
                     child_pids(channel_sup, channel_server)),
-    {MapWorkerCount, MapWorkerQueueTotal, MapWorkerQueueMax} =
-        queue_stats(child_pids(map_worker_sup, map_worker)),
-    MapWorkerQueues = maps:from_list([
-        {MapId, process_queue_length(whereis(map_worker:server_name(MapId)))}
-     || MapId <- map_router:map_ids()]),
+    {MapServerCount, MapServerQueueTotal, MapServerQueueMax} =
+        queue_stats(child_pids(map_server_sup, map_server)),
+    MapServerQueues = maps:from_list([
+        {MapId, process_queue_length(whereis(map_server:server_name(MapId)))}
+     || MapId <- map_server:map_ids()]),
     {WorkerCount, WorkerQueueTotal, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
-    NearbyWorkers = child_pids(channel_sup, nearby_broadcast_worker),
-    {NearbyWorkerCount, NearbyQueueTotal, NearbyQueueMax} =
-        queue_stats(NearbyWorkers),
-    NearbyStats = nearby_stats(),
     ChannelBatchStats = channel_batch_stats(),
     {WorldFlushes, WorldRolePackets, WorldPayloadBytes} =
         broadcast_delivery_stats(world),
-    {MapFlushes, MapRolePackets, MapPayloadBytes} =
-        broadcast_delivery_stats(map),
-    {NearbyDeliveryFlushes, NearbyRolePackets, NearbyPayloadBytes} =
-        broadcast_delivery_stats(nearby),
     #{node => node(),
       schedulers_online => erlang:system_info(schedulers_online),
       online_count => table_size(online_roles),
@@ -43,22 +35,13 @@ snapshot() ->
       channel_count => ChannelCount,
       channel_queue_total => ChannelQueueTotal,
       channel_queue_max => ChannelQueueMax,
-      map_router_count => process_count(chat_sup, map_router),
-      map_worker_count => MapWorkerCount,
-      map_worker_queue_total => MapWorkerQueueTotal,
-      map_worker_queue_max => MapWorkerQueueMax,
-      map_worker_queues => MapWorkerQueues,
+      map_server_count => MapServerCount,
+      map_server_queue_total => MapServerQueueTotal,
+      map_server_queue_max => MapServerQueueMax,
+      map_server_queues => MapServerQueues,
       world_worker_count => WorkerCount,
       world_worker_queue_total => WorkerQueueTotal,
       world_worker_queue_max => WorkerQueueMax,
-      nearby_worker_count => NearbyWorkerCount,
-      nearby_worker_queue_total => NearbyQueueTotal,
-      nearby_worker_queue_max => NearbyQueueMax,
-      nearby_messages => maps:get(messages, NearbyStats),
-      nearby_targets => maps:get(targets, NearbyStats),
-      nearby_flushes => maps:get(flushes, NearbyStats),
-      nearby_batch_messages => maps:get(batch_messages, NearbyStats),
-      nearby_batch_max => maps:get(batch_max, NearbyStats),
       channel_timer_flushes => maps:get(timer, ChannelBatchStats),
       channel_full_flushes => maps:get(full, ChannelBatchStats),
       channel_member_sends => maps:get(member_change, ChannelBatchStats),
@@ -67,13 +50,7 @@ snapshot() ->
       world_batch_flushes => WorldFlushes,
       world_role_packets => WorldRolePackets,
       world_payload_bytes => WorldPayloadBytes,
-      map_batch_flushes => MapFlushes,
-      map_role_packets => MapRolePackets,
-      map_payload_bytes => MapPayloadBytes,
-      nearby_delivery_flushes => NearbyDeliveryFlushes,
-      nearby_role_packets => NearbyRolePackets,
-      nearby_payload_bytes => NearbyPayloadBytes,
-      map_operations => map_router:operation_stats(),
+      map_operations => map_server:operation_stats(),
       beam_process_count => erlang:system_info(process_count),
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
@@ -113,6 +90,7 @@ online_client(RoleName, RolePid) ->
       role_pid => RolePid,
       message_queue_len => QueueLength,
       map_id => proplists:get_value(map_id, Dictionary),
+      map_pid => proplists:get_value(map_pid, Dictionary),
       position => proplists:get_value(position, Dictionary)}.
 
 child_pids(Supervisor, Module) ->
@@ -136,25 +114,6 @@ add_queue_length(Pid, {Count, Total, Max}) ->
         undefined ->
             {Count, Total, Max}
     end.
-
-nearby_stats() ->
-    lists:foldl(
-        fun({_MapId, Messages, Targets, Flushes,
-             BatchMessages, BatchMax}, Acc) ->
-            Acc#{messages := maps:get(messages, Acc) + Messages,
-                 targets := maps:get(targets, Acc) + Targets,
-                 flushes := maps:get(flushes, Acc) + Flushes,
-                 batch_messages := maps:get(batch_messages, Acc) +
-                                   BatchMessages,
-                 batch_max := erlang:max(
-                     maps:get(batch_max, Acc), BatchMax)}
-        end,
-        #{messages => 0,
-          targets => 0,
-          flushes => 0,
-          batch_messages => 0,
-          batch_max => 0},
-        table_rows(nearby_batch_metrics)).
 
 channel_batch_stats() ->
     lists:foldl(
@@ -189,9 +148,6 @@ table_rows(Table) ->
         undefined -> [];
         _ -> ets:tab2list(Table)
     end.
-
-process_count(Supervisor, Module) ->
-    length(child_pids(Supervisor, Module)).
 
 process_queue_length(Pid) when is_pid(Pid) ->
     case process_info(Pid, message_queue_len) of

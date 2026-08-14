@@ -168,10 +168,6 @@ decode_packet(<<?PROTO_NEARBY_PUSH:16, SenderRoleId:32, X:8, Y:8,
     end;
 decode_packet(<<?PROTO_NEARBY_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
-decode_packet(<<?PROTO_NEARBY_PUSH_BATCH:16,
-                MessageCount:16, MessageData/binary>>) ->
-    decode_push_batch(
-        nearby_push_batch, nearby_push, MessageCount, MessageData, []);
 decode_packet(<<?PROTO_MAP_JOIN_RESULT:16, ?RESULT_SUCCESS:8,
                 MapId:16, X:8, Y:8>>) ->
     {ok, {map_join_result, {ok, MapId, {X, Y}}}};
@@ -202,11 +198,6 @@ decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
     end;
 decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
-decode_packet(<<?PROTO_MAP_CHAT_PUSH_BATCH:16,
-                MessageCount:16, MessageData/binary>>) ->
-    decode_push_batch(
-        map_chat_push_batch, map_chat_push,
-        MessageCount, MessageData, []);
 decode_packet(<<?PROTO_ERROR:16, RequestProtoId:16, ErrorCode:8>>) ->
     {ok, {server_error, RequestProtoId, decode_error(ErrorCode)}};
 decode_packet(<<ProtoId:16, _Data/binary>>) ->

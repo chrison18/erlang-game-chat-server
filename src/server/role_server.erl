@@ -191,34 +191,49 @@ handle_business_request({send_nearby, Content}, Socket, RoleId) ->
     Result = send_nearby_message(RoleId, get(role_name), Content),
     send_packet(Socket, chat_server_protocol:encode_nearby_send_result(Result));
 handle_business_request({join_map, MapId}, Socket, RoleId) ->
-    SpawnPosition = map_router:random_position(),
-    %% map_worker 同时提交频道成员和双 ETS 后，Role 才接受新地图与坐标。
-    ProtocolResult = case map_router:join(
-                              RoleId, self(), MapId, SpawnPosition) of
-        {ok, {MapId, Position}} ->
-            put(map_id, MapId),
-            put(position, Position),
-            {ok, MapId, Position};
-        {error, invalid_map} ->
-            {error, invalid_map, MapId};
-        {error, {already_in_map, CurrentMapId}} ->
+    SpawnPosition = map_server:random_position(),
+    ProtocolResult = case get(map_id) of
+        CurrentMapId when is_integer(CurrentMapId) ->
             {error, already_in_map, CurrentMapId};
-        {error, map_unavailable} ->
-            {error, map_unavailable, MapId}
+        undefined ->
+            case map_server:valid_map(MapId) of
+                false ->
+                    {error, invalid_map, MapId};
+                true ->
+                    MapPid = map_server:pid(MapId),
+                    case map_server:join(
+                             MapPid, RoleId, self(), SpawnPosition) of
+                        {ok, {MapId, Position}} ->
+                            put(map_id, MapId),
+                            put(map_pid, MapPid),
+                            put(position, Position),
+                            {ok, MapId, Position};
+                        {error, {already_in_map, CurrentMapId}} ->
+                            {error, already_in_map, CurrentMapId};
+                        {error, map_unavailable} ->
+                            {error, map_unavailable, MapId}
+                    end
+            end
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_join_result(ProtocolResult));
 handle_business_request(leave_map, Socket, RoleId) ->
-    %% 地图层确认清理完成后再擦除本地状态，失败时仍保留原归属。
-    ProtocolResult = case map_router:leave(RoleId, self()) of
-        {ok, _MapId} = Result ->
-            erase(map_id),
-            erase(position),
-            Result;
-        {error, not_in_map} = Error ->
-            Error;
-        {error, {map_unavailable, MapId}} ->
-            {error, map_unavailable, MapId}
+    %% 地图进程确认清理完成后再擦除本地状态，失败时仍保留原归属。
+    ProtocolResult = case get(map_id) of
+        undefined ->
+            {error, not_in_map};
+        MapId ->
+            case map_server:leave(get(map_pid), RoleId, self()) of
+                {ok, _MapId} = Result ->
+                    erase(map_id),
+                    erase(map_pid),
+                    erase(position),
+                    Result;
+                {error, not_in_map} = Error ->
+                    Error;
+                {error, map_unavailable} ->
+                    {error, map_unavailable, MapId}
+            end
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_leave_result(ProtocolResult));
@@ -248,17 +263,19 @@ handle_login(Socket, RoleName, Password) ->
     end.
 
 complete_login(Socket, RoleId, RoleName) ->
-    InitialPosition = map_router:random_position(),
-    InitialMapId = map_router:default_map_id(),
+    InitialPosition = map_server:random_position(),
+    InitialMapId = map_server:default_map_id(),
+    InitialMapPid = map_server:pid(InitialMapId),
     %% 登录初始化顺序：进入地图 -> 加入初始频道 -> 发布 Role 本地状态和成功响应。
-    case map_router:join(
-             RoleId, self(), InitialMapId, InitialPosition) of
+    case map_server:join(
+             InitialMapPid, RoleId, self(), InitialPosition) of
         {ok, {InitialMapId, InitialPosition}} ->
             case join_initial_channels(RoleId) of
                 {ok, ChannelIds} ->
                     put(role_id, RoleId),
                     put(role_name, RoleName),
                     put(map_id, InitialMapId),
+                    put(map_pid, InitialMapPid),
                     put(position, InitialPosition),
                     put(channel_ids, maps:from_list(
                         [{ChannelId, true} || ChannelId <- ChannelIds])),
@@ -302,15 +319,6 @@ join_channels([ChannelId | Rest], RoleId) ->
         {error, _Reason} = Error -> Error
     end.
 
-maybe_rejoin_channel({map, MapId}) ->
-    %% 频道或地图 Worker 重启时，只按 Role 当前仍持有的成员真相恢复。
-    case get(map_id) of
-        MapId ->
-            _ = channel_server:join_map(MapId, get(role_id), self()),
-            ok;
-        _ ->
-            ok
-    end;
 maybe_rejoin_channel(ChannelId) ->
     case get(channel_ids) of
         #{ChannelId := true} ->
@@ -351,27 +359,20 @@ send_private_message(TargetRoleName, SenderRoleId, SenderRoleName, Content) ->
 send_map_message(_RoleId, _RoleName, undefined, _Content) ->
     {error, not_in_map};
 send_map_message(RoleId, RoleName, MapId, Content) ->
-    case channel_server:send_map(MapId, RoleId, RoleName, Content) of
-        {ok, {map, MapId}} -> {ok, MapId};
-        {error, not_joined} -> {error, not_in_map};
-        {error, channel_unavailable} ->
-            {error, map_unavailable, MapId}
+    case map_server:send_map(
+             get(map_pid), RoleId, self(), RoleName, Content) of
+        {ok, MapId} -> {ok, MapId};
+        {error, not_in_map} -> {error, not_in_map};
+        {error, map_unavailable} -> {error, map_unavailable, MapId}
     end.
 
 send_nearby_message(RoleId, RoleName, Content) ->
     case get(map_id) of
         undefined ->
             {error, not_in_map};
-        MapId ->
-            Position = get(position),
-            %% 先取九宫格目标快照，再交给对应地图 Worker 按来源格子组批。
-            {ok, Targets} = map_router:nearby({MapId, Position}),
-            {X, Y} = Position,
-            Packet = chat_server_protocol:encode_nearby_push(
-                RoleId, RoleName, X, Y, Content),
-            ok = nearby_broadcast_worker:send(
-                MapId, Position, Packet, Targets),
-            {ok, length(Targets)}
+        _MapId ->
+            map_server:send_nearby(
+                get(map_pid), RoleId, self(), RoleName, Content)
     end.
 
 move(Direction, {X, Y} = Position) ->
@@ -386,26 +387,27 @@ move(Direction, {X, Y} = Position) ->
         invalid ->
             {error, invalid_direction, Position};
         _ ->
-            case map_router:valid_position(Target) of
+            case map_server:valid_position(Target) of
                 true -> relocate(Position, Target);
                 false -> {error, out_of_bounds, Position}
             end
     end.
 
 teleport(Target, Position) ->
-    case map_router:valid_position(Target) of
+    case map_server:valid_position(Target) of
         true -> relocate(Position, Target);
         false -> {error, invalid_position, Position}
     end.
 
 relocate(OldPosition, NewPosition) ->
-    %% ETS 双索引更新成功后才更新 Role 缓存；不可用错误保留旧坐标。
-    case map_router:relocate(self(), NewPosition) of
+    %% 地图进程更新成功后才更新 Role 缓存；不可用错误保留旧坐标。
+    case map_server:relocate(get(map_pid), self(), NewPosition) of
         {ok, NewPosition} ->
             put(position, NewPosition),
             {ok, NewPosition};
         {error, not_in_map} ->
             erase(map_id),
+            erase(map_pid),
             erase(position),
             {error, not_in_map};
         {error, invalid_position} ->

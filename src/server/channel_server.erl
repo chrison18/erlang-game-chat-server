@@ -1,14 +1,13 @@
 -module(channel_server).
 -behaviour(gen_server).
 
-%% 公共频道和地图内部频道共用的成员与批量广播进程。
+%% 公共频道成员与批量广播进程。
 %% main 频道只维护成员分片，实际广播由 world_broadcast_worker 完成。
 
 -include("chat_protocol.hrl").
 -include("chat_record.hrl").
 
 -export([child_spec/1,
-         map_child_spec/1,
          channels/0,
          channel/1,
          world_member_tables/0,
@@ -16,12 +15,7 @@
          start_link/2,
          join/3,
          leave/2,
-         send_channel/4,
-         join_map/3,
-         join_map/4,
-         leave_map/2,
-         leave_map/3,
-         send_map/4]).
+         send_channel/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_continue/2,
          handle_info/2]).
 
@@ -35,12 +29,6 @@ child_spec(ChannelId) ->
     #{id => {channel_server, ChannelId},
       start => {channel_server, start_link,
                 [ChannelId, ChannelType]}}.
-
-map_child_spec(MapId) ->
-    MapChannelId = {map, MapId},
-    #{id => {map_channel_server, MapId},
-      start => {channel_server, start_link,
-                [MapChannelId, ?CHANNEL_TYPE_PUBLIC]}}.
 
 channels() ->
     [channel_tuple(ChannelId) || ChannelId <- lists:seq(1, 10)].
@@ -103,22 +91,6 @@ send_channel(ChannelId, RoleId, RoleName, Content) ->
         error ->
             {error, invalid_channel}
     end.
-
-join_map(MapId, RoleId, RolePid) ->
-    channel_call({map, MapId}, {join, RoleId, RolePid}).
-
-join_map(MapId, RoleId, RolePid, Deadline) ->
-    channel_call({map, MapId}, {join, RoleId, RolePid}, Deadline).
-
-leave_map(MapId, RoleId) ->
-    channel_call({map, MapId}, {leave, RoleId}).
-
-leave_map(MapId, RoleId, Deadline) ->
-    channel_call({map, MapId}, {leave, RoleId}, Deadline).
-
-send_map(MapId, RoleId, RoleName, Content) ->
-    channel_call(
-        {map, MapId}, {send_channel, RoleId, RoleName, Content}).
 
 init([ChannelId, Type]) ->
     ok = create_world_members(Type),
@@ -270,9 +242,6 @@ remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
 
-encode_push({map, MapId}, RoleId, RoleName, Content) ->
-    chat_server_protocol:encode_map_chat_push(
-        MapId, RoleId, RoleName, Content);
 encode_push(ChannelId, RoleId, RoleName, Content) ->
     chat_server_protocol:encode_channel_push(
         ChannelId, RoleId, RoleName, Content).
@@ -306,7 +275,7 @@ flush_batch(Reason,
     cancel_flush_timer(State),
     %% generation 每次全批发送后递增，使跨批加入/离开的偏移不会串批。
     OrderedPackets = lists:reverse(Packets),
-    {_, RolePackets, PayloadBytes} = maps:fold(
+    {_, _, _} = maps:fold(
         fun(_RoleId, Member, BatchAcc) ->
             send_batch(ChannelId, BatchGeneration, BatchSize,
                        OrderedPackets, Member, BatchAcc)
@@ -314,7 +283,6 @@ flush_batch(Reason,
         {#{}, 0, 0},
         Members),
     record_channel_batch(ChannelId, Reason, BatchSize),
-    record_map_delivery(ChannelId, 1, RolePackets, PayloadBytes),
     State#channel_state{packets = [],
                         batch_size = 0,
                         batch_generation = BatchGeneration + 1,
@@ -361,7 +329,6 @@ send_pending_batch(ChannelId, RolePid, BatchStart, BatchSize, Packets)
         ChannelId, lists:nthtail(BatchStart, lists:reverse(Packets))),
     gen_server:cast(RolePid, {push_batch, BatchPacket}),
     record_channel_batch(ChannelId, member_change, BatchSize - BatchStart),
-    record_map_delivery(ChannelId, 0, 1, byte_size(BatchPacket)),
     ok;
 send_pending_batch(_ChannelId, _RolePid, _BatchStart, _BatchSize, _Packets) ->
     ok.
@@ -387,20 +354,12 @@ record_channel_batch(ChannelId, Reason, Size) ->
             true = ets:insert(channel_batch_metrics, {Key, 1, Size, Size})
     end.
 
-record_map_delivery({map, _MapId}, Flushes, RolePackets, PayloadBytes) ->
-    chat_metrics:record_broadcast_delivery(
-        map, Flushes, RolePackets, PayloadBytes);
-record_map_delivery(_ChannelId, _Flushes, _RolePackets, _PayloadBytes) ->
-    ok.
-
 cancel_flush_timer(#channel_state{flush_ref = undefined}) ->
     ok;
 cancel_flush_timer(#channel_state{flush_ref = Ref}) ->
     _ = erlang:cancel_timer(Ref, [{async, true}, {info, false}]),
     ok.
 
-encode_batch({map, _MapId}, Packets) ->
-    chat_server_protocol:encode_map_chat_push_batch(Packets);
 encode_batch(_ChannelId, Packets) ->
     chat_server_protocol:encode_channel_push_batch(Packets).
 
@@ -445,7 +404,4 @@ server_name(6) -> public_channel_server_5;
 server_name(7) -> public_channel_server_6;
 server_name(8) -> public_channel_server_7;
 server_name(9) -> public_channel_server_8;
-server_name(10) -> public_channel_server_9;
-server_name({map, 1}) -> map_channel_server_1;
-server_name({map, 2}) -> map_channel_server_2;
-server_name({map, 3}) -> map_channel_server_3.
+server_name(10) -> public_channel_server_9.
