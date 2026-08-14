@@ -16,7 +16,8 @@
          pid/1,
          join/4,
          leave/3,
-         relocate/3,
+         move/3,
+         teleport/3,
          send_nearby/5,
          send_map/5,
          operation_stats/0,
@@ -65,8 +66,11 @@ join(MapPid, RoleId, RolePid, Position) ->
 leave(MapPid, RoleId, RolePid) ->
     call(MapPid, {leave, RoleId, RolePid}).
 
-relocate(MapPid, RolePid, NewPosition) ->
-    call(MapPid, {relocate, RolePid, NewPosition}).
+move(MapPid, RolePid, NewPosition) ->
+    call(MapPid, {move, RolePid, NewPosition}).
+
+teleport(MapPid, RolePid, NewPosition) ->
+    call(MapPid, {teleport, RolePid, NewPosition}).
 
 send_nearby(MapPid, RoleId, RolePid, RoleName, Content) ->
     call(MapPid, {send_nearby, RoleId, RolePid, RoleName, Content}).
@@ -163,29 +167,26 @@ handle_call({leave, RoleId, RolePid}, _From,
             {{error, not_in_map}, State}
     end,
     operation_reply(MapId, leave, StartedAt, ReplyState);
-handle_call({relocate, RolePid, NewPosition}, _From,
+handle_call({move, RolePid, NewPosition}, _From,
             #{map_id := MapId, members := Members, cells := Cells} = State) ->
     StartedAt = erlang:monotonic_time(microsecond),
     ReplyState = case valid_position(NewPosition) of
         false ->
             {{error, invalid_position}, State};
         true ->
-            case find_member(RolePid, Members) of
-                error ->
-                    {{error, not_in_map}, State};
-                {_RoleId, #{position := NewPosition}} ->
-                    {{ok, NewPosition}, State};
-                {RoleId, #{position := OldPosition} = Member} ->
-                    NewMember = Member#{position := NewPosition},
-                    NewState = State#{members := Members#{RoleId => NewMember},
-                                      cells := add_cell(
-                                          NewPosition, RolePid,
-                                          remove_cell(OldPosition, RolePid,
-                                                      Cells))},
-                    {{ok, NewPosition}, NewState}
-            end
+            change_position(RolePid, NewPosition, Members, Cells, State)
     end,
-    operation_reply(MapId, relocate, StartedAt, ReplyState);
+    operation_reply(MapId, move, StartedAt, ReplyState);
+handle_call({teleport, RolePid, NewPosition}, _From,
+            #{map_id := MapId, members := Members, cells := Cells} = State) ->
+    StartedAt = erlang:monotonic_time(microsecond),
+    ReplyState = case valid_position(NewPosition) of
+        false ->
+            {{error, invalid_position}, State};
+        true ->
+            change_position(RolePid, NewPosition, Members, Cells, State)
+    end,
+    operation_reply(MapId, teleport, StartedAt, ReplyState);
 handle_call({send_nearby, RoleId, RolePid, RoleName, Content}, _From,
             #{members := Members, cells := Cells} = State) ->
     case maps:find(RoleId, Members) of
@@ -256,6 +257,21 @@ find_member(RolePid, Members) ->
              maps:to_list(Members)) of
         [Member | _] -> Member;
         [] -> error
+    end.
+
+change_position(RolePid, NewPosition, Members, Cells, State) ->
+    case find_member(RolePid, Members) of
+        error ->
+            {{error, not_in_map}, State};
+        {_RoleId, #{position := NewPosition}} ->
+            {{ok, NewPosition}, State};
+        {RoleId, #{position := OldPosition} = Member} ->
+            NewMember = Member#{position := NewPosition},
+            NewState = State#{members := Members#{RoleId => NewMember},
+                              cells := add_cell(
+                                  NewPosition, RolePid,
+                                  remove_cell(OldPosition, RolePid, Cells))},
+            {{ok, NewPosition}, NewState}
     end.
 
 nearby_targets({X, Y}, Cells) ->

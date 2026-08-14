@@ -11,6 +11,17 @@
 
 -define(AUTO_SEND_INTERVAL_MS, 1000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
+-define(MOVEMENT_SCHEDULE,
+        [{30, move},
+         {40, move},
+         {45, move},
+         {200, move},
+         {210, move},
+         {220, move},
+         {230, move},
+         {900, move},
+         {950, move},
+         {1000, teleport}]).
 
 start_link(Host, Port, RoleName, Password, Mode) ->
     gen_server:start_link(
@@ -87,13 +98,14 @@ handle_info(auto_action,
     ActionState = do_auto_action(Content, State),
     schedule_next_action(),
     {noreply, ActionState#{action_seq := Sequence + 1}};
-handle_info(auto_action,
-            #{mode := map_load,
-              role_name := RoleName,
-              action_seq := Sequence} = State) ->
-    Content = auto_message(RoleName, Sequence),
-    ActionState = do_map_load_action(Content, State),
-    schedule_next_action(),
+handle_info({movement_action, move},
+            #{mode := map_load, action_seq := Sequence} = State) ->
+    ActionState = do_move(random_direction(), State),
+    {noreply, ActionState#{action_seq := Sequence + 1}};
+handle_info({movement_action, teleport},
+            #{mode := map_load, action_seq := Sequence} = State) ->
+    ActionState = do_teleport(random_coordinate(), random_coordinate(), State),
+    schedule_movement_cycle(),
     {noreply, ActionState#{action_seq := Sequence + 1}};
 handle_info(observer_report,
             #{mode := observer,
@@ -302,11 +314,6 @@ handle_response({move_result, {ok, Position} = Result}, State) ->
     report_result(move, Result, State#{position := Position});
 handle_response({move_result, Result}, State) ->
     report_result(move, Result, State);
-handle_response({teleport_result, {ok, Position} = Result},
-                #{mode := map_load, load_started := false} = State) ->
-    schedule_next_action(),
-    report_result(teleport, Result,
-                  State#{position := Position, load_started := true});
 handle_response({teleport_result, {ok, Position} = Result}, State) ->
     report_result(teleport, Result, State#{position := Position});
 handle_response({teleport_result, Result}, State) ->
@@ -397,16 +404,22 @@ start_mode_after_login(#{mode := normal} = State) ->
     schedule_next_action(),
     State;
 start_mode_after_login(#{mode := map_load} = State) ->
-    %% map_load 先等待随机传送成功，再启动周期动作，避免初始请求重叠。
-    do_teleport(rand:uniform(?MAP_SIZE) - 1,
-                rand:uniform(?MAP_SIZE) - 1,
-                State);
+    schedule_movement_cycle(),
+    State;
 start_mode_after_login(State) ->
     State.
 
 schedule_next_action() ->
     _ = erlang:send_after(
         ?AUTO_SEND_INTERVAL_MS, self(), auto_action),
+    ok.
+
+schedule_movement_cycle() ->
+    lists:foreach(
+        fun({Delay, Action}) ->
+            _ = erlang:send_after(Delay, self(), {movement_action, Action})
+        end,
+        ?MOVEMENT_SCHEDULE),
     ok.
 
 schedule_observer_report() ->
@@ -427,8 +440,7 @@ mode_state({normal, ClientId, StartId, EndId}, State) ->
            channel_ids => []};
 mode_state(map_load, State) ->
     State#{mode => map_load,
-           channel_ids => [],
-           load_started => false};
+           channel_ids => []};
 mode_state(manual, State) ->
     State#{mode => manual,
            channel_ids => []};
@@ -453,13 +465,6 @@ do_auto_action(Content, State) ->
         5 -> do_send_nearby(Content, State);
         6 -> do_send_map(Content, State);
         7 -> auto_switch_map(State)
-    end.
-
-do_map_load_action(Content, State) ->
-    case rand:uniform(2) of
-        1 -> do_move(element(rand:uniform(4),
-                             {up, down, left, right}), State);
-        2 -> do_send_nearby(Content, State)
     end.
 
 auto_private(Content,

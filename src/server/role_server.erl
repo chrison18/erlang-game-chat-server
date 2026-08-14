@@ -388,33 +388,46 @@ move(Direction, {X, Y} = Position) ->
             {error, invalid_direction, Position};
         _ ->
             case map_server:valid_position(Target) of
-                true -> relocate(Position, Target);
+                true ->
+                    case map_server:move(get(map_pid), self(), Target) of
+                        {ok, Target} ->
+                            put(position, Target),
+                            {ok, Target};
+                        {error, not_in_map} ->
+                            clear_map_state(),
+                            {error, not_in_map};
+                        {error, invalid_position} ->
+                            {error, out_of_bounds, Position};
+                        {error, map_unavailable} ->
+                            {error, map_unavailable, Position}
+                    end;
                 false -> {error, out_of_bounds, Position}
             end
     end.
 
 teleport(Target, Position) ->
     case map_server:valid_position(Target) of
-        true -> relocate(Position, Target);
+        true ->
+            case map_server:teleport(get(map_pid), self(), Target) of
+                {ok, Target} ->
+                    put(position, Target),
+                    {ok, Target};
+                {error, not_in_map} ->
+                    clear_map_state(),
+                    {error, not_in_map};
+                {error, invalid_position} ->
+                    {error, invalid_position, Position};
+                {error, map_unavailable} ->
+                    {error, map_unavailable, Position}
+            end;
         false -> {error, invalid_position, Position}
     end.
 
-relocate(OldPosition, NewPosition) ->
-    %% 地图进程更新成功后才更新 Role 缓存；不可用错误保留旧坐标。
-    case map_server:relocate(get(map_pid), self(), NewPosition) of
-        {ok, NewPosition} ->
-            put(position, NewPosition),
-            {ok, NewPosition};
-        {error, not_in_map} ->
-            erase(map_id),
-            erase(map_pid),
-            erase(position),
-            {error, not_in_map};
-        {error, invalid_position} ->
-            {error, invalid_position, OldPosition};
-        {error, map_unavailable} ->
-            {error, map_unavailable, OldPosition}
-    end.
+clear_map_state() ->
+    erase(map_id),
+    erase(map_pid),
+    erase(position),
+    ok.
 
 handle_push_send(Socket, Packet, State) ->
     case send_packet(Socket, Packet) of

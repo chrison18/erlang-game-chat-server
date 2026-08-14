@@ -3,4 +3,5 @@
 /_build/
 /rebar.lock
 /.codex/project_notes/
+/AGENTS.md
 /Chat V1.1 调优报告（试验稿）.md
