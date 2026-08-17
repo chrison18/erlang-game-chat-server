@@ -102,7 +102,7 @@ init([ChannelId, Type]) ->
         ?CHANNEL_TYPE_MAIN ->
             {ok, State};
         ?CHANNEL_TYPE_PUBLIC ->
-            %% 普通/地图频道重启后由在线 Role 的本地状态反向恢复成员。
+            %% 公共频道重启后由在线 Role 的本地状态反向恢复成员。
             {ok, State, {continue, recover_members}}
     end.
 
@@ -175,7 +175,8 @@ handle_call({send_channel, RoleId, RoleName, Content}, _From,
         false ->
             {reply, {error, not_joined}, State};
         true ->
-            Packet = encode_push(ChannelId, RoleId, RoleName, Content),
+            Packet = chat_server_protocol:encode_channel_push(
+                ChannelId, RoleId, RoleName, Content),
             {NewState, BatchFull} = enqueue(Packet, State),
             case BatchFull of
                 true ->
@@ -242,10 +243,6 @@ remove_world_member(?CHANNEL_TYPE_MAIN, RoleId) ->
 remove_world_member(?CHANNEL_TYPE_PUBLIC, _RoleId) ->
     ok.
 
-encode_push(ChannelId, RoleId, RoleName, Content) ->
-    chat_server_protocol:encode_channel_push(
-        ChannelId, RoleId, RoleName, Content).
-
 enqueue(Packet, #channel_state{packets = Packets,
                                batch_size = BatchSize,
                                flush_ref = undefined} = State) ->
@@ -275,12 +272,12 @@ flush_batch(Reason,
     cancel_flush_timer(State),
     %% generation 每次全批发送后递增，使跨批加入/离开的偏移不会串批。
     OrderedPackets = lists:reverse(Packets),
-    {_, _, _} = maps:fold(
+    _ = maps:fold(
         fun(_RoleId, Member, BatchAcc) ->
-            send_batch(ChannelId, BatchGeneration, BatchSize,
+            send_batch(BatchGeneration, BatchSize,
                        OrderedPackets, Member, BatchAcc)
         end,
-        {#{}, 0, 0},
+        #{},
         Members),
     record_channel_batch(ChannelId, Reason, BatchSize),
     State#channel_state{packets = [],
@@ -288,26 +285,25 @@ flush_batch(Reason,
                         batch_generation = BatchGeneration + 1,
                         flush_ref = undefined}.
 
-send_batch(_ChannelId, BatchGeneration, BatchSize, _OrderedPackets,
+send_batch(BatchGeneration, BatchSize, _OrderedPackets,
            #channel_member{batch_generation = BatchGeneration,
                            batch_start = BatchStart}, BatchAcc)
   when BatchStart >= BatchSize ->
     BatchAcc;
-send_batch(ChannelId, BatchGeneration, _BatchSize, OrderedPackets,
+send_batch(BatchGeneration, _BatchSize, OrderedPackets,
            #channel_member{role_pid = RolePid,
                            batch_generation = MemberGeneration,
                            batch_start = MemberStart},
-           {BatchPackets, RolePackets, PayloadBytes}) ->
+           BatchPackets) ->
     %% 稳定成员从 0 开始；本批中途加入者只取自己 batch_start 后的消息。
     BatchStart = case MemberGeneration =:= BatchGeneration of
         true -> MemberStart;
         false -> 0
     end,
     {BatchPacket, NewBatchPackets} = batch_packet(
-        ChannelId, BatchStart, OrderedPackets, BatchPackets),
+        BatchStart, OrderedPackets, BatchPackets),
     gen_server:cast(RolePid, {push_batch, BatchPacket}),
-    {NewBatchPackets, RolePackets + 1,
-     PayloadBytes + byte_size(BatchPacket)}.
+    NewBatchPackets.
 
 send_pending(#channel_state{channel_id = ChannelId,
                             packets = Packets,
@@ -325,21 +321,21 @@ send_pending(#channel_state{channel_id = ChannelId,
 
 send_pending_batch(ChannelId, RolePid, BatchStart, BatchSize, Packets)
   when BatchStart < BatchSize ->
-    BatchPacket = encode_batch(
-        ChannelId, lists:nthtail(BatchStart, lists:reverse(Packets))),
+    BatchPacket = chat_server_protocol:encode_channel_push_batch(
+        lists:nthtail(BatchStart, lists:reverse(Packets))),
     gen_server:cast(RolePid, {push_batch, BatchPacket}),
     record_channel_batch(ChannelId, member_change, BatchSize - BatchStart),
     ok;
 send_pending_batch(_ChannelId, _RolePid, _BatchStart, _BatchSize, _Packets) ->
     ok.
 
-batch_packet(ChannelId, BatchStart, OrderedPackets, BatchPackets) ->
+batch_packet(BatchStart, OrderedPackets, BatchPackets) ->
     case maps:find(BatchStart, BatchPackets) of
         {ok, BatchPacket} ->
             {BatchPacket, BatchPackets};
         error ->
-            BatchPacket = encode_batch(
-                ChannelId, lists:nthtail(BatchStart, OrderedPackets)),
+            BatchPacket = chat_server_protocol:encode_channel_push_batch(
+                lists:nthtail(BatchStart, OrderedPackets)),
             {BatchPacket, BatchPackets#{BatchStart => BatchPacket}}
     end.
 
@@ -359,9 +355,6 @@ cancel_flush_timer(#channel_state{flush_ref = undefined}) ->
 cancel_flush_timer(#channel_state{flush_ref = Ref}) ->
     _ = erlang:cancel_timer(Ref, [{async, true}, {info, false}]),
     ok.
-
-encode_batch(_ChannelId, Packets) ->
-    chat_server_protocol:encode_channel_push_batch(Packets).
 
 channel_tuple(ChannelId) ->
     {ok, ChannelType, ChannelName} = channel(ChannelId),
