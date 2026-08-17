@@ -91,6 +91,39 @@ map_chat_stops_after_leave_test_() ->
          end
      end}.
 
+map_chat_batches_packets_in_order_test_() ->
+    {setup,
+     fun start_map/0,
+     fun stop_map/1,
+     fun(MapPid) ->
+         fun() ->
+             RolePid = start_role_proxy(role1),
+             try
+                 ?assertEqual({ok, {10, {10, 10}}},
+                              map_server:join(
+                                  MapPid, 1, RolePid, {10, 10})),
+                 ?assertEqual(ok,
+                              map_server:send_map(
+                                  MapPid, 1, RolePid,
+                                  <<"alice">>, <<"first">>)),
+                 ?assertEqual(ok,
+                              map_server:send_map(
+                                  MapPid, 1, RolePid,
+                                  <<"alice">>, <<"second">>)),
+                 assert_map_result(role1, MapPid, send_map, {ok, 10}),
+                 assert_map_result(role1, MapPid, send_map, {ok, 10}),
+                 {ok, [FirstPacket, SecondPacket]} =
+                     receive_push_packets(role1, 500),
+                 assert_map_chat_packet(
+                     FirstPacket, 10, 1, <<"alice">>, <<"first">>),
+                 assert_map_chat_packet(
+                     SecondPacket, 10, 1, <<"alice">>, <<"second">>)
+             after
+                 stop_role_proxies([RolePid])
+             end
+         end
+     end}.
+
 map_chat_protocol_roundtrip_test() ->
     Content = <<"hello">>,
     ?assertEqual(
@@ -139,6 +172,9 @@ stop_role_proxies(RolePids) ->
 
 assert_map_chat(Label, MapId, RoleId, RoleName, Content) ->
     {ok, Packet} = receive_push(Label, 500),
+    assert_map_chat_packet(Packet, MapId, RoleId, RoleName, Content).
+
+assert_map_chat_packet(Packet, MapId, RoleId, RoleName, Content) ->
     ?assertEqual(
         {ok, {map_chat_push,
               #{map_id => MapId,
@@ -157,9 +193,15 @@ assert_map_result(Label, MapPid, Operation, Expected) ->
     end.
 
 receive_push(Label, Timeout) ->
+    case receive_push_packets(Label, Timeout) of
+        {ok, [Packet]} -> {ok, Packet};
+        timeout -> timeout
+    end.
+
+receive_push_packets(Label, Timeout) ->
     receive
-        {Label, {'$gen_cast', {push_batch, Packet}}} ->
-            {ok, Packet}
+        {Label, {'$gen_cast', {push_packets, Packets}}} ->
+            {ok, Packets}
     after Timeout ->
         timeout
     end.

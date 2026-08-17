@@ -25,6 +25,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(CALL_TIMEOUT_MS, 5000).
+-define(MAP_CHAT_BATCH_WINDOW_MS, 120).
 
 child_spec(MapId) ->
     #{id => {map_server, MapId},
@@ -119,6 +120,8 @@ init([MapId]) ->
            members => #{},
            cells => #{},
            monitors => #{},
+           map_packets => [],
+           map_flush_ref => undefined,
            operations => #{}}}.
 
 handle_call({join, RoleId, RolePid, Position}, _From,
@@ -207,11 +210,9 @@ handle_cast({send_map, RoleId, RolePid, RoleName, Content},
         {ok, #{role_pid := RolePid}} ->
             Packet = chat_server_protocol:encode_map_chat_push(
                 MapId, RoleId, RoleName, Content),
-            Targets = [MemberPid
-                       || #{role_pid := MemberPid} <- maps:values(Members)],
+            NewState = enqueue_map_packet(Packet, State),
             send_result(RolePid, send_map, {ok, MapId}),
-            push(Targets, Packet),
-            operation_noreply(send_map, StartedAt, State);
+            operation_noreply(send_map, StartedAt, NewState);
         _ ->
             send_result(RolePid, send_map, {error, not_in_map}),
             operation_noreply(send_map, StartedAt, State)
@@ -219,6 +220,9 @@ handle_cast({send_map, RoleId, RolePid, RoleName, Content},
 handle_cast(_Request, State) ->
     {noreply, State}.
 
+handle_info({timeout, Ref, flush_map_chat},
+            #{map_flush_ref := Ref} = State) ->
+    {noreply, flush_map_chat(State)};
 handle_info({'DOWN', MonitorRef, process, _RolePid, _Reason},
             #{members := Members,
               cells := Cells,
@@ -345,6 +349,29 @@ push(Targets, Packet) ->
         Targets),
     ok.
 
+enqueue_map_packet(Packet,
+                   #{map_packets := Packets,
+                     map_flush_ref := undefined} = State) ->
+    Ref = erlang:start_timer(
+        ?MAP_CHAT_BATCH_WINDOW_MS, self(), flush_map_chat),
+    State#{map_packets := [Packet | Packets], map_flush_ref := Ref};
+enqueue_map_packet(Packet, #{map_packets := Packets} = State) ->
+    State#{map_packets := [Packet | Packets]}.
+
+flush_map_chat(#{map_id := MapId,
+                 map_packets := Packets,
+                 members := Members} = State) ->
+    StartedAt = erlang:monotonic_time(microsecond),
+    OrderedPackets = lists:reverse(Packets),
+    maps:foreach(
+        fun(_RoleId, #{role_pid := RolePid}) ->
+            gen_server:cast(RolePid, {push_packets, OrderedPackets})
+        end,
+        Members),
+    record_map_batch(MapId, length(Packets), maps:size(Members),
+                     erlang:monotonic_time(microsecond) - StartedAt),
+    State#{map_packets := [], map_flush_ref := undefined}.
+
 send_result(RolePid, Operation, Result) ->
     gen_server:cast(RolePid, {map_result, self(), Operation, Result}).
 
@@ -357,6 +384,7 @@ operation_noreply(Operation, StartedAt, State) ->
 
 record_operation(MapId, Operation, StartedAt, State) ->
     ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
+    record_map_operation(MapId, Operation, ElapsedUs),
     Operations = maps:get(operations, State),
     Previous = maps:get(Operation, Operations,
                         #{count => 0, total_us => 0, max_us => 0}),
@@ -366,3 +394,37 @@ record_operation(MapId, Operation, StartedAt, State) ->
                                              ElapsedUs)},
     State#{map_id := MapId,
            operations := Operations#{Operation => Updated}}.
+
+record_map_operation(MapId, Operation, ElapsedUs) ->
+    Key = {MapId, Operation},
+    try ets:update_counter(
+            map_operation_metrics, Key,
+            [{2, 1}, {3, ElapsedUs}],
+            {Key, 0, 0}) of
+        _ -> ok
+    catch
+        error:badarg -> ok
+    end.
+
+record_map_batch(MapId, BatchSize, RoleCount, ElapsedUs) ->
+    try ets:lookup(map_batch_metrics, MapId) of
+        [{MapId, Flushes, Messages, MaxBatch, RoleCasts, TotalUs, MaxUs}] ->
+            true = ets:insert(
+                map_batch_metrics,
+                {MapId,
+                 Flushes + 1,
+                 Messages + BatchSize,
+                 erlang:max(MaxBatch, BatchSize),
+                 RoleCasts + RoleCount,
+                 TotalUs + ElapsedUs,
+                 erlang:max(MaxUs, ElapsedUs)}),
+            ok;
+        [] ->
+            true = ets:insert(
+                map_batch_metrics,
+                {MapId, 1, BatchSize, BatchSize,
+                 RoleCount, ElapsedUs, ElapsedUs}),
+            ok
+    catch
+        error:badarg -> ok
+    end.

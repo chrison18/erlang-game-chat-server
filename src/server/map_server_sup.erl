@@ -10,6 +10,10 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    map_operation_metrics = ets:new(
+        map_operation_metrics, [named_table, public, set, {write_concurrency, true}]),
+    map_batch_metrics = ets:new(
+        map_batch_metrics, [named_table, public, set]),
     SupFlags = #{strategy => one_for_one,
                  intensity => 5,
                  period => 10},

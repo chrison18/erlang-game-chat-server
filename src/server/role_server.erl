@@ -19,6 +19,8 @@ init([]) ->
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
+handle_cast({push_packets, Packets}, #{socket := Socket} = State) ->
+    handle_push_packets(Socket, Packets, State);
 handle_cast({push_batch, Packet}, #{socket := Socket} = State) ->
     handle_push_send(Socket, Packet, State);
 handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
@@ -439,6 +441,16 @@ handle_push_send(Socket, Packet, State) ->
     case send_packet(Socket, Packet) of
         ok ->
             {noreply, State};
+        {error, Reason} ->
+            {stop, Reason, State}
+    end.
+
+handle_push_packets(_Socket, [], State) ->
+    {noreply, State};
+handle_push_packets(Socket, [Packet | Packets], State) ->
+    case send_packet(Socket, Packet) of
+        ok ->
+            handle_push_packets(Socket, Packets, State);
         {error, Reason} ->
             {stop, Reason, State}
     end.

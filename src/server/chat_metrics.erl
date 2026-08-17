@@ -5,7 +5,24 @@
 -include("chat_record.hrl").
 
 -export([snapshot/0, online_clients/0, print_online_clients/0,
-         record_broadcast_delivery/4]).
+         record_broadcast_delivery/4, map_diagnostic_snapshot/0]).
+
+map_diagnostic_snapshot() ->
+    #{operations => maps:from_list([
+          {Key, #{count => Count,
+                  total_us => TotalUs,
+                  avg_us => average(TotalUs, Count)}}
+       || {Key, Count, TotalUs} <- table_rows(map_operation_metrics)]),
+      batches => maps:from_list([
+          {MapId, #{flushes => Flushes,
+                    messages => Messages,
+                    max_batch => MaxBatch,
+                    role_casts => RoleCasts,
+                    total_us => TotalUs,
+                    max_us => MaxUs,
+                    avg_us => average(TotalUs, Flushes)}}
+       || {MapId, Flushes, Messages, MaxBatch, RoleCasts, TotalUs, MaxUs} <-
+              table_rows(map_batch_metrics)])}.
 
 snapshot() ->
     %% snapshot 只读取当前状态；缺失的监督者或 ETS 会按空数据处理。
