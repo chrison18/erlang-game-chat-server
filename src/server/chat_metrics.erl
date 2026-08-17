@@ -5,7 +5,7 @@
 -include("chat_record.hrl").
 
 -export([snapshot/0, online_clients/0, print_online_clients/0,
-         record_broadcast_delivery/4, map_diagnostic_snapshot/0]).
+         record_world_broadcast_delivery/2, map_diagnostic_snapshot/0]).
 
 map_diagnostic_snapshot() ->
     #{operations => maps:from_list([
@@ -39,7 +39,7 @@ snapshot() ->
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
     ChannelBatchStats = channel_batch_stats(),
     {WorldFlushes, WorldRolePackets, WorldPayloadBytes} =
-        broadcast_delivery_stats(world),
+        world_broadcast_delivery_stats(),
     #{node => node(),
       schedulers_online => erlang:system_info(schedulers_online),
       online_count => table_size(online_roles),
@@ -66,10 +66,10 @@ snapshot() ->
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
 
-record_broadcast_delivery(Type, Flushes, RolePackets, PayloadBytes) ->
+record_world_broadcast_delivery(RolePackets, PayloadBytes) ->
     try ets:update_counter(
-            broadcast_delivery_metrics, Type,
-            [{2, Flushes}, {3, RolePackets}, {4, PayloadBytes}]) of
+            broadcast_delivery_metrics, world,
+            [{2, 1}, {3, RolePackets}, {4, PayloadBytes}]) of
         _ -> ok
     catch
         error:badarg -> ok
@@ -147,15 +147,14 @@ channel_batch_stats() ->
           messages => 0, max => 0},
         table_rows(channel_batch_metrics)).
 
-broadcast_delivery_stats(Type) ->
-    case table_rows(broadcast_delivery_metrics) of
-        Rows ->
-            case lists:keyfind(Type, 1, Rows) of
-                {Type, Flushes, RolePackets, PayloadBytes} ->
-                    {Flushes, RolePackets, PayloadBytes};
-                false ->
-                    {0, 0, 0}
-            end
+world_broadcast_delivery_stats() ->
+    try ets:lookup(broadcast_delivery_metrics, world) of
+        [{world, Flushes, RolePackets, PayloadBytes}] ->
+            {Flushes, RolePackets, PayloadBytes};
+        [] ->
+            {0, 0, 0}
+    catch
+        error:badarg -> {0, 0, 0}
     end.
 
 table_size(Table) ->
