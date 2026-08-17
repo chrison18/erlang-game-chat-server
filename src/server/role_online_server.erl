@@ -5,14 +5,14 @@
 
 -include("chat_record.hrl").
 
--export([start_link/0, login/3]).
+-export([start_link/0, login/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-login(RolePid, RoleName, Password) ->
-    gen_server:call(?MODULE, {login, RolePid, RoleName, Password}).
+login(RoleName, Password) ->
+    gen_server:call(?MODULE, {login, RoleName, Password}).
 
 init([]) ->
     role_accounts = ets:new(role_accounts, [
@@ -29,7 +29,7 @@ init([]) ->
     ]),
     {ok, #{next_role_id => 1, monitors => #{}}}.
 
-handle_call({login, RolePid, RoleName, Password}, _From, State) ->
+handle_call({login, RoleName, Password}, {RolePid, _Tag}, State) ->
     login_role(RolePid, RoleName, Password, State);
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
