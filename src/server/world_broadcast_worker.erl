@@ -110,8 +110,8 @@ broadcast(Packets, WorkerIndex) ->
         end,
         0,
         MemberTable),
-    chat_metrics:record_broadcast_delivery(
-        world, 1, RolePackets, RolePackets * byte_size(BatchPacket)).
+    chat_metrics:record_world_broadcast_delivery(
+        RolePackets, RolePackets * byte_size(BatchPacket)).
 
 worker_name(1) -> world_broadcast_worker_1;
 worker_name(2) -> world_broadcast_worker_2;
