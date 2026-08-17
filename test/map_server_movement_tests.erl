@@ -18,7 +18,7 @@ move_and_teleport_are_distinct_test_() ->
              ?assertEqual({ok, {80, 90}}, receive_result(MapPid, teleport)),
              ?assertEqual(ok,
                           map_server:send_nearby(
-                              MapPid, 1, RolePid, <<"alice">>, <<"nearby">>)),
+                              MapPid, RolePid, <<"alice">>, <<"nearby">>)),
              ?assertEqual({ok, 1}, receive_result(MapPid, send_nearby)),
              assert_nearby_push(1, <<"alice">>, {80, 90}, <<"nearby">>),
              ?assertEqual(ok,
@@ -27,7 +27,8 @@ move_and_teleport_are_distinct_test_() ->
                           receive_result(MapPid, teleport)),
              Stats = map_server:operation_stats(10),
              ?assertMatch(#{move := #{count := 1},
-                            teleport := #{count := 2}},
+                            teleport := #{count := 2},
+                            send_nearby := #{count := 1}},
                           Stats),
              ?assertEqual(false, maps:is_key(relocate, Stats))
          end

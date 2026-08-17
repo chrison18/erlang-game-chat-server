@@ -212,7 +212,7 @@ handle_business_request({teleport, Position}, Socket, _RoleId) ->
                             {error, map_unavailable, get(position)}))
             end
     end;
-handle_business_request({send_nearby, Content}, Socket, RoleId) ->
+handle_business_request({send_nearby, Content}, Socket, _RoleId) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
@@ -220,7 +220,7 @@ handle_business_request({send_nearby, Content}, Socket, RoleId) ->
                     {error, not_in_map}));
         _MapId ->
             case map_server:send_nearby(
-                     get(map_pid), RoleId, self(), get(role_name), Content) of
+                     get(map_pid), self(), get(role_name), Content) of
                 ok -> ok;
                 {error, map_unavailable} -> {error, map_unavailable}
             end
@@ -252,13 +252,13 @@ handle_business_request({join_map, MapId}, Socket, RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_join_result(ProtocolResult));
-handle_business_request(leave_map, Socket, RoleId) ->
+handle_business_request(leave_map, Socket, _RoleId) ->
     %% 地图进程确认清理完成后再擦除本地状态，失败时仍保留原归属。
     ProtocolResult = case get(map_id) of
         undefined ->
             {error, not_in_map};
         MapId ->
-            case map_server:leave(get(map_pid), RoleId, self()) of
+            case map_server:leave(get(map_pid), self()) of
                 {ok, _MapId} = Result ->
                     erase(map_id),
                     erase(map_pid),
@@ -272,7 +272,7 @@ handle_business_request(leave_map, Socket, RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_leave_result(ProtocolResult));
-handle_business_request({send_map, Content}, Socket, RoleId) ->
+handle_business_request({send_map, Content}, Socket, _RoleId) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
@@ -280,7 +280,7 @@ handle_business_request({send_map, Content}, Socket, RoleId) ->
                     {error, not_in_map}));
         MapId ->
             case map_server:send_map(
-                     get(map_pid), RoleId, self(), get(role_name), Content) of
+                     get(map_pid), self(), get(role_name), Content) of
                 ok -> ok;
                 {error, map_unavailable} ->
                     send_packet(Socket,
