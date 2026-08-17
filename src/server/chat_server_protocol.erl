@@ -80,11 +80,8 @@ decode_request(<<?PROTO_MAP_LEAVE_REQUEST:16, _Data/binary>>) ->
     {error, {invalid_packet, ?PROTO_MAP_LEAVE_REQUEST}};
 decode_request(<<?PROTO_MAP_CHAT_SEND_REQUEST:16, Content/binary>>) ->
     {ok, {send_map, Content}};
-decode_request(<<ProtoId:16, Data/binary>>) ->
-    case is_request_proto(ProtoId) of
-        true -> {ok, {request, ProtoId, Data}};
-        false -> {error, {unknown_proto, ProtoId}}
-    end;
+decode_request(<<ProtoId:16, _Data/binary>>) ->
+    {error, {unknown_proto, ProtoId}};
 decode_request(_Packet) ->
     {error, {invalid_packet, 0}}.
 
@@ -262,19 +259,6 @@ encode_error(RequestProtoId, invalid_packet) ->
     <<?PROTO_ERROR:16, RequestProtoId:16, ?ERROR_INVALID_PACKET:8>>;
 encode_error(RequestProtoId, unknown_proto) ->
     <<?PROTO_ERROR:16, RequestProtoId:16, ?ERROR_UNKNOWN_PROTO:8>>.
-
-is_request_proto(?PROTO_CHANNEL_LIST_REQUEST) -> true;
-is_request_proto(?PROTO_CHANNEL_JOIN_REQUEST) -> true;
-is_request_proto(?PROTO_CHANNEL_LEAVE_REQUEST) -> true;
-is_request_proto(?PROTO_CHANNEL_SEND_REQUEST) -> true;
-is_request_proto(?PROTO_PRIVATE_SEND_REQUEST) -> true;
-is_request_proto(?PROTO_MAP_MOVE_REQUEST) -> true;
-is_request_proto(?PROTO_MAP_TELEPORT_REQUEST) -> true;
-is_request_proto(?PROTO_NEARBY_SEND_REQUEST) -> true;
-is_request_proto(?PROTO_MAP_JOIN_REQUEST) -> true;
-is_request_proto(?PROTO_MAP_LEAVE_REQUEST) -> true;
-is_request_proto(?PROTO_MAP_CHAT_SEND_REQUEST) -> true;
-is_request_proto(_ProtoId) -> false.
 
 decode_direction(?MAP_DIRECTION_UP) -> up;
 decode_direction(?MAP_DIRECTION_DOWN) -> down;

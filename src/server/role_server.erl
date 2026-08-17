@@ -109,13 +109,6 @@ handle_packet(Packet, Socket) ->
         {ok, {send_map, Content}} ->
             handle_authenticated_request(
                 ?PROTO_MAP_CHAT_SEND_REQUEST, {send_map, Content}, Socket);
-        {ok, {request, ProtoId, _Data}} ->
-            case get(role_id) of
-                undefined -> send_packet(Socket,
-                    chat_server_protocol:encode_error(ProtoId, not_logged_in));
-                _RoleId -> send_packet(Socket,
-                    chat_server_protocol:encode_error(ProtoId, unknown_proto))
-            end;
         {error, {invalid_packet, ProtoId}} ->
             send_packet(Socket,
                 chat_server_protocol:encode_error(ProtoId, invalid_packet));
