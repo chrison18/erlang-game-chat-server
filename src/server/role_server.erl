@@ -129,11 +129,11 @@ handle_authenticated_request(ProtoId, Request, Socket) ->
         undefined ->
             send_packet(Socket,
                 chat_server_protocol:encode_error(ProtoId, not_logged_in));
-        RoleId ->
-            handle_business_request(Request, Socket, RoleId)
+        _ ->
+            handle_business_request(Request, Socket)
     end.
 
-handle_business_request(list_channels, Socket, _RoleId) ->
+handle_business_request(list_channels, Socket) ->
     JoinedChannels = get(channel_ids),
     ChannelList = [
         {ChannelId,
@@ -143,9 +143,9 @@ handle_business_request(list_channels, Socket, _RoleId) ->
      || {ChannelId, ChannelType, ChannelName} <- channel_server:channels()],
     send_packet(Socket,
         chat_server_protocol:encode_channel_list_result(ChannelList));
-handle_business_request({join_channel, ChannelId}, Socket, RoleId) ->
+handle_business_request({join_channel, ChannelId}, Socket) ->
     %% 频道进程确认成功后才更新 Role 的本地成员缓存。
-    ProtocolResult = case channel_server:join(ChannelId, RoleId, self()) of
+    ProtocolResult = case channel_server:join(ChannelId, get(role_id), self()) of
         {ok, ChannelId} = Result ->
             put(channel_ids, maps:put(ChannelId, true, get(channel_ids))),
             Result;
@@ -154,8 +154,8 @@ handle_business_request({join_channel, ChannelId}, Socket, RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_channel_join_result(ProtocolResult));
-handle_business_request({leave_channel, ChannelId}, Socket, RoleId) ->
-    ProtocolResult = case channel_server:leave(ChannelId, RoleId) of
+handle_business_request({leave_channel, ChannelId}, Socket) ->
+    ProtocolResult = case channel_server:leave(ChannelId, get(role_id)) of
         {ok, ChannelId} = Result ->
             put(channel_ids, maps:remove(ChannelId, get(channel_ids))),
             Result;
@@ -164,18 +164,18 @@ handle_business_request({leave_channel, ChannelId}, Socket, RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_channel_leave_result(ProtocolResult));
-handle_business_request({send_channel, ChannelId, Content}, Socket, RoleId) ->
-    Result = send_channel_message(ChannelId, RoleId, get(role_name), Content),
+handle_business_request({send_channel, ChannelId, Content}, Socket) ->
+    Result = send_channel_message(
+        ChannelId, get(role_id), get(role_name), Content),
     ProtocolResult = case Result of
         {ok, ChannelId} -> {ok, ChannelId};
         {error, Reason} -> {error, Reason, ChannelId}
     end,
     send_packet(Socket,
         chat_server_protocol:encode_channel_send_result(ProtocolResult));
-handle_business_request({send_private, TargetRoleName, Content}, Socket,
-                        RoleId) ->
+handle_business_request({send_private, TargetRoleName, Content}, Socket) ->
     Result = send_private_message(
-        TargetRoleName, RoleId, get(role_name), Content),
+        TargetRoleName, get(role_id), get(role_name), Content),
     ProtocolResult = case Result of
         {ok, TargetRoleName} -> {ok, TargetRoleName};
         {error, target_offline} ->
@@ -183,7 +183,7 @@ handle_business_request({send_private, TargetRoleName, Content}, Socket,
     end,
     send_packet(Socket,
         chat_server_protocol:encode_private_send_result(ProtocolResult));
-handle_business_request({move, Direction}, Socket, _RoleId) ->
+handle_business_request({move, Direction}, Socket) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
@@ -197,7 +197,7 @@ handle_business_request({move, Direction}, Socket, _RoleId) ->
                             {error, map_unavailable, get(position)}))
             end
     end;
-handle_business_request({teleport, Position}, Socket, _RoleId) ->
+handle_business_request({teleport, Position}, Socket) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
@@ -212,7 +212,7 @@ handle_business_request({teleport, Position}, Socket, _RoleId) ->
                             {error, map_unavailable, get(position)}))
             end
     end;
-handle_business_request({send_nearby, Content}, Socket, _RoleId) ->
+handle_business_request({send_nearby, Content}, Socket) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
@@ -225,7 +225,7 @@ handle_business_request({send_nearby, Content}, Socket, _RoleId) ->
                 {error, map_unavailable} -> {error, map_unavailable}
             end
     end;
-handle_business_request({join_map, MapId}, Socket, RoleId) ->
+handle_business_request({join_map, MapId}, Socket) ->
     SpawnPosition = map_server:random_position(),
     ProtocolResult = case get(map_id) of
         CurrentMapId when is_integer(CurrentMapId) ->
@@ -237,7 +237,7 @@ handle_business_request({join_map, MapId}, Socket, RoleId) ->
                 true ->
                     MapPid = map_server:pid(MapId),
                     case map_server:join(
-                             MapPid, RoleId, self(), SpawnPosition) of
+                             MapPid, get(role_id), self(), SpawnPosition) of
                         {ok, {MapId, Position}} ->
                             put(map_id, MapId),
                             put(map_pid, MapPid),
@@ -252,7 +252,7 @@ handle_business_request({join_map, MapId}, Socket, RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_join_result(ProtocolResult));
-handle_business_request(leave_map, Socket, _RoleId) ->
+handle_business_request(leave_map, Socket) ->
     %% 地图进程确认清理完成后再擦除本地状态，失败时仍保留原归属。
     ProtocolResult = case get(map_id) of
         undefined ->
@@ -272,7 +272,7 @@ handle_business_request(leave_map, Socket, _RoleId) ->
     end,
     send_packet(Socket,
         chat_server_protocol:encode_map_leave_result(ProtocolResult));
-handle_business_request({send_map, Content}, Socket, _RoleId) ->
+handle_business_request({send_map, Content}, Socket) ->
     case get(map_id) of
         undefined ->
             send_packet(Socket,
