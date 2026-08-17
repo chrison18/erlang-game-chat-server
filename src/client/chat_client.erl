@@ -21,7 +21,8 @@
          {230, move},
          {900, move},
          {950, move},
-         {1000, teleport}]).
+         {980, move},
+         {1000, map_chat}]).
 
 start_link(Host, Port, RoleName, Password, Mode) ->
     gen_server:start_link(
@@ -102,9 +103,12 @@ handle_info({movement_action, move},
             #{mode := map_load, action_seq := Sequence} = State) ->
     ActionState = do_move(random_direction(), State),
     {noreply, ActionState#{action_seq := Sequence + 1}};
-handle_info({movement_action, teleport},
-            #{mode := map_load, action_seq := Sequence} = State) ->
-    ActionState = do_teleport(random_coordinate(), random_coordinate(), State),
+handle_info({movement_action, map_chat},
+            #{mode := map_load,
+              role_name := RoleName,
+              action_seq := Sequence} = State) ->
+    Content = map_load_message(RoleName, Sequence),
+    ActionState = do_send_map(Content, State),
     schedule_movement_cycle(),
     {noreply, ActionState#{action_seq := Sequence + 1}};
 handle_info(observer_report,
@@ -429,6 +433,10 @@ schedule_observer_report() ->
 
 auto_message(RoleName, Sequence) ->
     <<RoleName/binary, " auto message ",
+      (integer_to_binary(Sequence))/binary>>.
+
+map_load_message(RoleName, Sequence) ->
+    <<RoleName/binary, " map message ",
       (integer_to_binary(Sequence))/binary>>.
 
 mode_state(observer, State) ->

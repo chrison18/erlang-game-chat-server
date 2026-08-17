@@ -50,7 +50,7 @@ snapshot() ->
       world_batch_flushes => WorldFlushes,
       world_role_packets => WorldRolePackets,
       world_payload_bytes => WorldPayloadBytes,
-      map_operations => map_server:operation_stats(),
+      map_operations => add_average(map_server:operation_stats()),
       beam_process_count => erlang:system_info(process_count),
       beam_port_count => erlang:system_info(port_count),
       beam_memory_mb => erlang:memory(total) / (1024 * 1024)}.
@@ -63,6 +63,16 @@ record_broadcast_delivery(Type, Flushes, RolePackets, PayloadBytes) ->
     catch
         error:badarg -> ok
     end.
+
+add_average(Operations) ->
+    maps:map(
+        fun(_Operation, #{count := Count, total_us := TotalUs} = Stats) ->
+            Stats#{avg_us => average(TotalUs, Count)}
+        end,
+        Operations).
+
+average(_Total, 0) -> 0;
+average(Total, Count) -> Total / Count.
 
 online_clients() ->
     lists:sort([

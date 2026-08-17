@@ -202,16 +202,19 @@ handle_call({send_nearby, RoleId, RolePid, RoleName, Content}, _From,
     end;
 handle_call({send_map, RoleId, RolePid, RoleName, Content}, _From,
             #{map_id := MapId, members := Members} = State) ->
-    case maps:find(RoleId, Members) of
+    StartedAt = erlang:monotonic_time(microsecond),
+    ReplyState = case maps:find(RoleId, Members) of
         {ok, #{role_pid := RolePid}} ->
             Packet = chat_server_protocol:encode_map_chat_push(
                 MapId, RoleId, RoleName, Content),
-            push([MemberPid || #{role_pid := MemberPid} <- maps:values(Members)],
+            push([MemberPid
+                  || #{role_pid := MemberPid} <- maps:values(Members)],
                  Packet),
-            {reply, {ok, MapId}, State};
+            {{ok, MapId}, State};
         _ ->
-            {reply, {error, not_in_map}, State}
-    end;
+            {{error, not_in_map}, State}
+    end,
+    operation_reply(MapId, send_map, StartedAt, ReplyState);
 handle_call(operation_stats, _From, #{operations := Operations} = State) ->
     {reply, Operations, State};
 handle_call(_Request, _From, State) ->
