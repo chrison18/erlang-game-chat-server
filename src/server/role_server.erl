@@ -295,7 +295,7 @@ joined_value(false) -> 0.
 handle_login(Socket, RoleName, Password) ->
     case get(role_id) of
         undefined ->
-            case role_online_server:login(self(), RoleName, Password) of
+            case role_online_server:login(RoleName, Password) of
                 {ok, RoleId} ->
                     complete_login(Socket, RoleId, RoleName);
                 {error, Reason} ->
