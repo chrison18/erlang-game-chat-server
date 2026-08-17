@@ -76,9 +76,10 @@ ok = chat_load_test:join_map(1, 2).
 仍按单条推送。
 自动循环会持续产生消息。应从很小的客户端数量开始验证，再逐步增加规模。
 
-地图请求由 `role_server` 直接转发给登录或切图时保存的 `map_server_N` PID；各地图进程
-独立处理加入、退出、移动、传送、nearby 和地图聊天。`move` 与 `teleport` 使用独立的
-服务端入口和操作指标；同一地图内最终坐标变更复用一个内部状态更新函数。服务端 Shell 使用
+地图请求由 `role_server` 直接转发给登录或切图时保存的 `map_server_N` PID；加入和退出
+同步确认，移动、传送、nearby 和地图聊天通过 `cast` 提交并异步返回处理结果。移动方向
+由地图进程根据权威坐标计算。`move` 与 `teleport` 使用独立的服务端入口和操作指标；
+同一地图内最终坐标变更复用一个内部状态更新函数。服务端 Shell 使用
 `chat_metrics:snapshot().` 手动采集当前在线数、Role、频道、地图和世界 Worker 邮箱，
 以及地图操作的调用次数、平均耗时和最大耗时。`chat_metrics:print_online_clients().` 会
 打印在线角色、地图、地图 PID 和坐标。快照接口只在调用时读取状态，不启动常驻统计进程。

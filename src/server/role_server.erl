@@ -26,6 +26,12 @@ handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
     Packet = chat_server_protocol:encode_private_push(
         SenderRoleId, SenderRoleName, Content),
     handle_push_send(Socket, Packet, State);
+handle_cast({map_result, MapPid, Operation, Result},
+            #{socket := Socket} = State) ->
+    case get(map_pid) of
+        MapPid -> handle_map_result(Operation, Result, Socket, State);
+        _CurrentMapPid -> {noreply, State}
+    end;
 handle_cast({rejoin_channel, ChannelId}, State) ->
     maybe_rejoin_channel(ChannelId),
     {noreply, State};
@@ -176,20 +182,47 @@ handle_business_request({send_private, TargetRoleName, Content}, Socket,
     send_packet(Socket,
         chat_server_protocol:encode_private_send_result(ProtocolResult));
 handle_business_request({move, Direction}, Socket, _RoleId) ->
-    Result = case get(map_id) of
-        undefined -> {error, not_in_map};
-        _MapId -> move(Direction, get(position))
-    end,
-    send_packet(Socket, chat_server_protocol:encode_move_result(Result));
+    case get(map_id) of
+        undefined ->
+            send_packet(Socket,
+                chat_server_protocol:encode_move_result({error, not_in_map}));
+        _MapId ->
+            case map_server:move(get(map_pid), self(), Direction) of
+                ok -> ok;
+                {error, map_unavailable} ->
+                    send_packet(Socket,
+                        chat_server_protocol:encode_move_result(
+                            {error, map_unavailable, get(position)}))
+            end
+    end;
 handle_business_request({teleport, Position}, Socket, _RoleId) ->
-    Result = case get(map_id) of
-        undefined -> {error, not_in_map};
-        _MapId -> teleport(Position, get(position))
-    end,
-    send_packet(Socket, chat_server_protocol:encode_teleport_result(Result));
+    case get(map_id) of
+        undefined ->
+            send_packet(Socket,
+                chat_server_protocol:encode_teleport_result(
+                    {error, not_in_map}));
+        _MapId ->
+            case map_server:teleport(get(map_pid), self(), Position) of
+                ok -> ok;
+                {error, map_unavailable} ->
+                    send_packet(Socket,
+                        chat_server_protocol:encode_teleport_result(
+                            {error, map_unavailable, get(position)}))
+            end
+    end;
 handle_business_request({send_nearby, Content}, Socket, RoleId) ->
-    Result = send_nearby_message(RoleId, get(role_name), Content),
-    send_packet(Socket, chat_server_protocol:encode_nearby_send_result(Result));
+    case get(map_id) of
+        undefined ->
+            send_packet(Socket,
+                chat_server_protocol:encode_nearby_send_result(
+                    {error, not_in_map}));
+        _MapId ->
+            case map_server:send_nearby(
+                     get(map_pid), RoleId, self(), get(role_name), Content) of
+                ok -> ok;
+                {error, map_unavailable} -> {error, map_unavailable}
+            end
+    end;
 handle_business_request({join_map, MapId}, Socket, RoleId) ->
     SpawnPosition = map_server:random_position(),
     ProtocolResult = case get(map_id) of
@@ -238,10 +271,21 @@ handle_business_request(leave_map, Socket, RoleId) ->
     send_packet(Socket,
         chat_server_protocol:encode_map_leave_result(ProtocolResult));
 handle_business_request({send_map, Content}, Socket, RoleId) ->
-    Result = send_map_message(
-        RoleId, get(role_name), get(map_id), Content),
-    send_packet(Socket,
-        chat_server_protocol:encode_map_chat_send_result(Result)).
+    case get(map_id) of
+        undefined ->
+            send_packet(Socket,
+                chat_server_protocol:encode_map_chat_send_result(
+                    {error, not_in_map}));
+        MapId ->
+            case map_server:send_map(
+                     get(map_pid), RoleId, self(), get(role_name), Content) of
+                ok -> ok;
+                {error, map_unavailable} ->
+                    send_packet(Socket,
+                        chat_server_protocol:encode_map_chat_send_result(
+                            {error, map_unavailable, MapId}))
+            end
+    end.
 
 joined_value(true) -> 1;
 joined_value(false) -> 0.
@@ -356,72 +400,34 @@ send_private_message(TargetRoleName, SenderRoleId, SenderRoleName, Content) ->
             {error, target_offline}
     end.
 
-send_map_message(_RoleId, _RoleName, undefined, _Content) ->
-    {error, not_in_map};
-send_map_message(RoleId, RoleName, MapId, Content) ->
-    case map_server:send_map(
-             get(map_pid), RoleId, self(), RoleName, Content) of
-        {ok, MapId} -> {ok, MapId};
-        {error, not_in_map} -> {error, not_in_map};
-        {error, map_unavailable} -> {error, map_unavailable, MapId}
-    end.
-
-send_nearby_message(RoleId, RoleName, Content) ->
-    case get(map_id) of
-        undefined ->
-            {error, not_in_map};
-        _MapId ->
-            map_server:send_nearby(
-                get(map_pid), RoleId, self(), RoleName, Content)
-    end.
-
-move(Direction, {X, Y} = Position) ->
-    Target = case Direction of
-        up -> {X - 1, Y};
-        down -> {X + 1, Y};
-        left -> {X, Y - 1};
-        right -> {X, Y + 1};
-        invalid -> invalid
-    end,
-    case Target of
-        invalid ->
-            {error, invalid_direction, Position};
-        _ ->
-            case map_server:valid_position(Target) of
-                true ->
-                    case map_server:move(get(map_pid), self(), Target) of
-                        {ok, Target} ->
-                            put(position, Target),
-                            {ok, Target};
-                        {error, not_in_map} ->
-                            clear_map_state(),
-                            {error, not_in_map};
-                        {error, invalid_position} ->
-                            {error, out_of_bounds, Position};
-                        {error, map_unavailable} ->
-                            {error, map_unavailable, Position}
-                    end;
-                false -> {error, out_of_bounds, Position}
-            end
-    end.
-
-teleport(Target, Position) ->
-    case map_server:valid_position(Target) of
-        true ->
-            case map_server:teleport(get(map_pid), self(), Target) of
-                {ok, Target} ->
-                    put(position, Target),
-                    {ok, Target};
-                {error, not_in_map} ->
-                    clear_map_state(),
-                    {error, not_in_map};
-                {error, invalid_position} ->
-                    {error, invalid_position, Position};
-                {error, map_unavailable} ->
-                    {error, map_unavailable, Position}
-            end;
-        false -> {error, invalid_position, Position}
-    end.
+handle_map_result(move, {ok, Position} = Result, Socket, State) ->
+    put(position, Position),
+    handle_push_send(
+        Socket, chat_server_protocol:encode_move_result(Result), State);
+handle_map_result(move, {error, not_in_map} = Result, Socket, State) ->
+    clear_map_state(),
+    handle_push_send(
+        Socket, chat_server_protocol:encode_move_result(Result), State);
+handle_map_result(move, Result, Socket, State) ->
+    handle_push_send(
+        Socket, chat_server_protocol:encode_move_result(Result), State);
+handle_map_result(teleport, {ok, Position} = Result, Socket, State) ->
+    put(position, Position),
+    handle_push_send(
+        Socket, chat_server_protocol:encode_teleport_result(Result), State);
+handle_map_result(teleport, {error, not_in_map} = Result, Socket, State) ->
+    clear_map_state(),
+    handle_push_send(
+        Socket, chat_server_protocol:encode_teleport_result(Result), State);
+handle_map_result(teleport, Result, Socket, State) ->
+    handle_push_send(
+        Socket, chat_server_protocol:encode_teleport_result(Result), State);
+handle_map_result(send_nearby, Result, Socket, State) ->
+    handle_push_send(
+        Socket, chat_server_protocol:encode_nearby_send_result(Result), State);
+handle_map_result(send_map, Result, Socket, State) ->
+    handle_push_send(
+        Socket, chat_server_protocol:encode_map_chat_send_result(Result), State).
 
 clear_map_state() ->
     erase(map_id),

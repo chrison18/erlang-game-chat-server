@@ -18,9 +18,10 @@ map_chat_broadcasts_only_to_current_map_test_() ->
                               map_server:join(Map9, 2, Role2, {11, 10})),
                  ?assertEqual({ok, {10, {10, 10}}},
                               map_server:join(Map10, 3, Role3, {10, 10})),
-                 ?assertEqual({ok, 9},
+                 ?assertEqual(ok,
                               map_server:send_map(
                                   Map9, 100, Role1, <<"alice">>, <<"hello">>)),
+                 assert_map_result(role1, Map9, send_map, {ok, 9}),
                  assert_map_chat(role1, 9, 100, <<"alice">>, <<"hello">>),
                  assert_map_chat(role2, 9, 100, <<"alice">>, <<"hello">>),
                  ?assertEqual(timeout, receive_push(role3, 100)),
@@ -41,9 +42,11 @@ map_chat_rejects_non_member_test_() ->
              RolePid = start_role_proxy(non_member),
              try
                  ?assertEqual(
-                     {error, not_in_map},
+                     ok,
                      map_server:send_map(
                          MapPid, 99, RolePid, <<"unknown">>, <<"hello">>)),
+                 assert_map_result(
+                     non_member, MapPid, send_map, {error, not_in_map}),
                  ?assertEqual(timeout, receive_push(non_member, 100)),
                  ?assertEqual(
                      {error, map_unavailable},
@@ -70,12 +73,15 @@ map_chat_stops_after_leave_test_() ->
                               map_server:join(MapPid, 2, Role2, {11, 10})),
                  ?assertEqual({ok, 10},
                               map_server:leave(MapPid, 2, Role2)),
-                 ?assertEqual({error, not_in_map},
+                 ?assertEqual(ok,
                               map_server:send_map(
                                   MapPid, 2, Role2, <<"bob">>, <<"left">>)),
-                 ?assertEqual({ok, 10},
+                 assert_map_result(
+                     role2, MapPid, send_map, {error, not_in_map}),
+                 ?assertEqual(ok,
                               map_server:send_map(
                                   MapPid, 1, Role1, <<"alice">>, <<"still here">>)),
+                 assert_map_result(role1, MapPid, send_map, {ok, 10}),
                  assert_map_chat(
                      role1, 10, 1, <<"alice">>, <<"still here">>),
                  ?assertEqual(timeout, receive_push(role2, 100))
@@ -140,6 +146,15 @@ assert_map_chat(Label, MapId, RoleId, RoleName, Content) ->
                 sender_role_name => RoleName,
                 content => Content}}},
         chat_client_protocol:decode_packet(Packet)).
+
+assert_map_result(Label, MapPid, Operation, Expected) ->
+    receive
+        {Label, {'$gen_cast',
+                 {map_result, MapPid, Operation, Expected}}} ->
+            ok
+    after 500 ->
+        ?assert(false)
+    end.
 
 receive_push(Label, Timeout) ->
     receive

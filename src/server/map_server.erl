@@ -66,17 +66,17 @@ join(MapPid, RoleId, RolePid, Position) ->
 leave(MapPid, RoleId, RolePid) ->
     call(MapPid, {leave, RoleId, RolePid}).
 
-move(MapPid, RolePid, NewPosition) ->
-    call(MapPid, {move, RolePid, NewPosition}).
+move(MapPid, RolePid, Direction) ->
+    cast(MapPid, {move, RolePid, Direction}).
 
 teleport(MapPid, RolePid, NewPosition) ->
-    call(MapPid, {teleport, RolePid, NewPosition}).
+    cast(MapPid, {teleport, RolePid, NewPosition}).
 
 send_nearby(MapPid, RoleId, RolePid, RoleName, Content) ->
-    call(MapPid, {send_nearby, RoleId, RolePid, RoleName, Content}).
+    cast(MapPid, {send_nearby, RoleId, RolePid, RoleName, Content}).
 
 send_map(MapPid, RoleId, RolePid, RoleName, Content) ->
-    call(MapPid, {send_map, RoleId, RolePid, RoleName, Content}).
+    cast(MapPid, {send_map, RoleId, RolePid, RoleName, Content}).
 
 operation_stats() ->
     lists:foldl(
@@ -167,27 +167,25 @@ handle_call({leave, RoleId, RolePid}, _From,
             {{error, not_in_map}, State}
     end,
     operation_reply(MapId, leave, StartedAt, ReplyState);
-handle_call({move, RolePid, NewPosition}, _From,
-            #{map_id := MapId, members := Members, cells := Cells} = State) ->
+handle_call(operation_stats, _From, #{operations := Operations} = State) ->
+    {reply, Operations, State};
+handle_call(_Request, _From, State) ->
+    {reply, {error, map_unavailable}, State}.
+
+handle_cast({move, RolePid, Direction},
+            #{members := Members, cells := Cells} = State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    ReplyState = case valid_position(NewPosition) of
-        false ->
-            {{error, invalid_position}, State};
-        true ->
-            change_position(RolePid, NewPosition, Members, Cells, State)
-    end,
-    operation_reply(MapId, move, StartedAt, ReplyState);
-handle_call({teleport, RolePid, NewPosition}, _From,
-            #{map_id := MapId, members := Members, cells := Cells} = State) ->
+    {Result, NewState} = move_member(RolePid, Direction, Members, Cells, State),
+    send_result(RolePid, move, Result),
+    operation_noreply(move, StartedAt, NewState);
+handle_cast({teleport, RolePid, NewPosition},
+            #{members := Members, cells := Cells} = State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    ReplyState = case valid_position(NewPosition) of
-        false ->
-            {{error, invalid_position}, State};
-        true ->
-            change_position(RolePid, NewPosition, Members, Cells, State)
-    end,
-    operation_reply(MapId, teleport, StartedAt, ReplyState);
-handle_call({send_nearby, RoleId, RolePid, RoleName, Content}, _From,
+    {Result, NewState} = teleport_member(
+        RolePid, NewPosition, Members, Cells, State),
+    send_result(RolePid, teleport, Result),
+    operation_noreply(teleport, StartedAt, NewState);
+handle_cast({send_nearby, RoleId, RolePid, RoleName, Content},
             #{members := Members, cells := Cells} = State) ->
     case maps:find(RoleId, Members) of
         {ok, #{role_pid := RolePid, position := Position}} ->
@@ -195,31 +193,29 @@ handle_call({send_nearby, RoleId, RolePid, RoleName, Content}, _From,
             Packet = chat_server_protocol:encode_nearby_push(
                 RoleId, RoleName, X, Y, Content),
             Targets = nearby_targets(Position, Cells),
+            send_result(RolePid, send_nearby, {ok, length(Targets)}),
             push(Targets, Packet),
-            {reply, {ok, length(Targets)}, State};
+            {noreply, State};
         _ ->
-            {reply, {error, not_in_map}, State}
+            send_result(RolePid, send_nearby, {error, not_in_map}),
+            {noreply, State}
     end;
-handle_call({send_map, RoleId, RolePid, RoleName, Content}, _From,
+handle_cast({send_map, RoleId, RolePid, RoleName, Content},
             #{map_id := MapId, members := Members} = State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    ReplyState = case maps:find(RoleId, Members) of
+    case maps:find(RoleId, Members) of
         {ok, #{role_pid := RolePid}} ->
             Packet = chat_server_protocol:encode_map_chat_push(
                 MapId, RoleId, RoleName, Content),
-            push([MemberPid
-                  || #{role_pid := MemberPid} <- maps:values(Members)],
-                 Packet),
-            {{ok, MapId}, State};
+            Targets = [MemberPid
+                       || #{role_pid := MemberPid} <- maps:values(Members)],
+            send_result(RolePid, send_map, {ok, MapId}),
+            push(Targets, Packet),
+            operation_noreply(send_map, StartedAt, State);
         _ ->
-            {{error, not_in_map}, State}
-    end,
-    operation_reply(MapId, send_map, StartedAt, ReplyState);
-handle_call(operation_stats, _From, #{operations := Operations} = State) ->
-    {reply, Operations, State};
-handle_call(_Request, _From, State) ->
-    {reply, {error, map_unavailable}, State}.
-
+            send_result(RolePid, send_map, {error, not_in_map}),
+            operation_noreply(send_map, StartedAt, State)
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -252,6 +248,11 @@ call(MapPid, Request) when is_pid(MapPid) ->
         exit:_Reason -> {error, map_unavailable}
     end.
 
+cast(undefined, _Request) ->
+    {error, map_unavailable};
+cast(MapPid, Request) when is_pid(MapPid) ->
+    gen_server:cast(MapPid, Request).
+
 find_member(RolePid, Members) ->
     case lists:dropwhile(
              fun({_RoleId, #{role_pid := MemberPid}}) ->
@@ -275,6 +276,41 @@ change_position(RolePid, NewPosition, Members, Cells, State) ->
                                   NewPosition, RolePid,
                                   remove_cell(OldPosition, RolePid, Cells))},
             {{ok, NewPosition}, NewState}
+    end.
+
+move_member(RolePid, Direction, Members, Cells, State) ->
+    case find_member(RolePid, Members) of
+        error ->
+            {{error, not_in_map}, State};
+        {_RoleId, #{position := Position}} ->
+            case move_target(Direction, Position) of
+                invalid ->
+                    {{error, invalid_direction, Position}, State};
+                Target ->
+                    case valid_position(Target) of
+                        true -> change_position(
+                                    RolePid, Target, Members, Cells, State);
+                        false -> {{error, out_of_bounds, Position}, State}
+                    end
+            end
+    end.
+
+move_target(up, {X, Y}) -> {X - 1, Y};
+move_target(down, {X, Y}) -> {X + 1, Y};
+move_target(left, {X, Y}) -> {X, Y - 1};
+move_target(right, {X, Y}) -> {X, Y + 1};
+move_target(_Direction, _Position) -> invalid.
+
+teleport_member(RolePid, NewPosition, Members, Cells, State) ->
+    case find_member(RolePid, Members) of
+        error ->
+            {{error, not_in_map}, State};
+        {_RoleId, #{position := Position}} ->
+            case valid_position(NewPosition) of
+                true -> change_position(
+                            RolePid, NewPosition, Members, Cells, State);
+                false -> {{error, invalid_position, Position}, State}
+            end
     end.
 
 nearby_targets({X, Y}, Cells) ->
@@ -309,7 +345,17 @@ push(Targets, Packet) ->
         Targets),
     ok.
 
+send_result(RolePid, Operation, Result) ->
+    gen_server:cast(RolePid, {map_result, self(), Operation, Result}).
+
 operation_reply(MapId, Operation, StartedAt, {Reply, State}) ->
+    {reply, Reply, record_operation(MapId, Operation, StartedAt, State)}.
+
+operation_noreply(Operation, StartedAt, State) ->
+    MapId = maps:get(map_id, State),
+    {noreply, record_operation(MapId, Operation, StartedAt, State)}.
+
+record_operation(MapId, Operation, StartedAt, State) ->
     ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
     Operations = maps:get(operations, State),
     Previous = maps:get(Operation, Operations,
@@ -318,6 +364,5 @@ operation_reply(MapId, Operation, StartedAt, {Reply, State}) ->
                         total_us := maps:get(total_us, Previous) + ElapsedUs,
                         max_us := erlang:max(maps:get(max_us, Previous),
                                              ElapsedUs)},
-    {reply, Reply,
-     State#{map_id := MapId,
-            operations := Operations#{Operation => Updated}}}.
+    State#{map_id := MapId,
+           operations := Operations#{Operation => Updated}}.
