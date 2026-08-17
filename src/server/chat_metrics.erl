@@ -26,17 +26,16 @@ map_diagnostic_snapshot() ->
 
 snapshot() ->
     %% snapshot 只读取当前状态；缺失的监督者或 ETS 会按空数据处理。
-    {RoleCount, RoleQueueTotal, RoleQueueMax} =
+    {RoleCount, RoleQueueMax} =
         queue_stats(child_pids(role_sup, role_server)),
-    {ChannelCount, ChannelQueueTotal, ChannelQueueMax} =
+    {ChannelCount, ChannelQueueMax} =
         queue_stats(child_pids(chat_sup, channel_server) ++
                     child_pids(channel_sup, channel_server)),
-    {MapServerCount, MapServerQueueTotal, MapServerQueueMax} =
-        queue_stats(child_pids(map_server_sup, map_server)),
+    MapServerCount = length(child_pids(map_server_sup, map_server)),
     MapServerQueues = maps:from_list([
         {MapId, process_queue_length(whereis(map_server:server_name(MapId)))}
      || MapId <- map_server:map_ids()]),
-    {WorkerCount, WorkerQueueTotal, WorkerQueueMax} =
+    {WorkerCount, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
     ChannelBatchStats = channel_batch_stats(),
     {WorldFlushes, WorldRolePackets, WorldPayloadBytes} =
@@ -47,17 +46,12 @@ snapshot() ->
       world_member_count => lists:sum([
           table_size(Table) || Table <- channel_server:world_member_tables()]),
       role_count => RoleCount,
-      role_queue_total => RoleQueueTotal,
       role_queue_max => RoleQueueMax,
       channel_count => ChannelCount,
-      channel_queue_total => ChannelQueueTotal,
       channel_queue_max => ChannelQueueMax,
       map_server_count => MapServerCount,
-      map_server_queue_total => MapServerQueueTotal,
-      map_server_queue_max => MapServerQueueMax,
       map_server_queues => MapServerQueues,
       world_worker_count => WorkerCount,
-      world_worker_queue_total => WorkerQueueTotal,
       world_worker_queue_max => WorkerQueueMax,
       channel_timer_flushes => maps:get(timer, ChannelBatchStats),
       channel_full_flushes => maps:get(full, ChannelBatchStats),
@@ -132,14 +126,14 @@ child_pids(Supervisor, Module) ->
     end.
 
 queue_stats(Pids) ->
-    lists:foldl(fun add_queue_length/2, {0, 0, 0}, Pids).
+    lists:foldl(fun add_queue_length/2, {0, 0}, Pids).
 
-add_queue_length(Pid, {Count, Total, Max}) ->
+add_queue_length(Pid, {Count, Max}) ->
     case process_info(Pid, message_queue_len) of
         {message_queue_len, Length} ->
-            {Count + 1, Total + Length, erlang:max(Max, Length)};
+            {Count + 1, erlang:max(Max, Length)};
         undefined ->
-            {Count, Total, Max}
+            {Count, Max}
     end.
 
 channel_batch_stats() ->
