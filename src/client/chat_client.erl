@@ -136,10 +136,14 @@ terminate(_Reason, #{socket := Socket}) ->
 do_login(RoleName, Password, State) ->
     case normalize_texts([RoleName, Password]) of
         {ok, [RoleNameBinary, PasswordBinary]} ->
-            Packet = chat_client_protocol:encode_login(
-                RoleNameBinary, PasswordBinary),
-            send_packet(login, Packet,
-                        State#{role_name := RoleNameBinary});
+            case chat_client_protocol:encode_login(
+                     RoleNameBinary, PasswordBinary) of
+                Packet when is_binary(Packet) ->
+                    send_packet(login, Packet,
+                                State#{role_name := RoleNameBinary});
+                {error, Reason} ->
+                    report_result(login, {error, Reason}, State)
+            end;
         {error, Reason} ->
             report_result(login, {error, Reason}, State)
     end.
@@ -180,10 +184,14 @@ do_send_channel(_ChannelId, _Content, State) ->
 do_send_private(TargetRoleName, Content, State) ->
     case normalize_texts([TargetRoleName, Content]) of
         {ok, [TargetRoleNameBinary, ContentBinary]} ->
-            Packet = chat_client_protocol:encode_private_send(
-                TargetRoleNameBinary, ContentBinary),
-            send_packet({send_private, TargetRoleNameBinary},
-                        Packet, State);
+            case chat_client_protocol:encode_private_send(
+                     TargetRoleNameBinary, ContentBinary) of
+                Packet when is_binary(Packet) ->
+                    send_packet({send_private, TargetRoleNameBinary},
+                                Packet, State);
+                {error, Reason} ->
+                    report_result(send_private, {error, Reason}, State)
+            end;
         {error, Reason} ->
             report_result(send_private, {error, Reason}, State)
     end.

@@ -18,10 +18,13 @@
          encode_map_chat_send/1,
          decode_packet/1]).
 
-encode_login(RoleName, Password) ->
+encode_login(RoleName, Password)
+  when byte_size(RoleName) =< 16#FFFF ->
     NameLength = byte_size(RoleName),
     <<?PROTO_LOGIN_REQUEST:16, NameLength:16,
-      RoleName/binary, Password/binary>>.
+      RoleName/binary, Password/binary>>;
+encode_login(_RoleName, _Password) ->
+    {error, role_name_too_long}.
 
 encode_channel_list() ->
     <<?PROTO_CHANNEL_LIST_REQUEST:16>>.
@@ -35,10 +38,13 @@ encode_channel_leave(ChannelId) ->
 encode_channel_send(ChannelId, Content) ->
     <<?PROTO_CHANNEL_SEND_REQUEST:16, ChannelId:32, Content/binary>>.
 
-encode_private_send(TargetRoleName, Content) ->
+encode_private_send(TargetRoleName, Content)
+  when byte_size(TargetRoleName) =< 16#FFFF ->
     TargetNameLength = byte_size(TargetRoleName),
     <<?PROTO_PRIVATE_SEND_REQUEST:16, TargetNameLength:16,
-      TargetRoleName/binary, Content/binary>>.
+      TargetRoleName/binary, Content/binary>>;
+encode_private_send(_TargetRoleName, _Content) ->
+    {error, target_role_name_too_long}.
 
 encode_move(Direction) ->
     <<?PROTO_MAP_MOVE_REQUEST:16, (direction_code(Direction)):8>>.
@@ -100,8 +106,7 @@ decode_packet(<<?PROTO_CHANNEL_SEND_RESULT:16, _Data/binary>>) ->
     {error, invalid_packet};
 decode_packet(<<?PROTO_CHANNEL_PUSH_BATCH:16,
                 MessageCount:16, MessageData/binary>>) ->
-    decode_push_batch(
-        channel_push_batch, channel_push, MessageCount, MessageData, []);
+    decode_channel_push_batch(MessageCount, MessageData, []);
 decode_packet(<<?PROTO_CHANNEL_PUSH:16, ChannelId:32, SenderRoleId:32,
                 SenderNameLength:16, Data/binary>>) ->
     case Data of
@@ -210,26 +215,26 @@ decode_error(?ERROR_INVALID_PACKET) -> invalid_packet;
 decode_error(?ERROR_UNKNOWN_PROTO) -> unknown_proto;
 decode_error(ErrorCode) -> {unknown_error, ErrorCode}.
 
-decode_push_batch(BatchType, _MessageType, 0, <<>>, Messages) ->
-    {ok, {BatchType, lists:reverse(Messages)}};
-decode_push_batch(BatchType, MessageType, Count,
-                  <<PacketLength:32, Data/binary>>, Messages)
+decode_channel_push_batch(0, <<>>, Messages) ->
+    {ok, {channel_push_batch, lists:reverse(Messages)}};
+decode_channel_push_batch(Count,
+                          <<PacketLength:32, Data/binary>>,
+                          Messages)
   when Count > 0 ->
     %% 批类型不仅限制数量和长度，也限制每个内层包允许出现的消息类型。
     case Data of
         <<Packet:PacketLength/binary, RemainingData/binary>> ->
             case decode_packet(Packet) of
-                {ok, {MessageType, Message}} ->
-                    decode_push_batch(
-                        BatchType, MessageType, Count - 1,
-                        RemainingData, [Message | Messages]);
+                {ok, {channel_push, Message}} ->
+                    decode_channel_push_batch(
+                        Count - 1, RemainingData, [Message | Messages]);
                 _Error ->
                     {error, invalid_packet}
             end;
         _ ->
             {error, invalid_packet}
     end;
-decode_push_batch(_BatchType, _MessageType, _Count, _Data, _Messages) ->
+decode_channel_push_batch(_Count, _Data, _Messages) ->
     {error, invalid_packet}.
 
 decode_channels(0, <<>>, Acc) ->
