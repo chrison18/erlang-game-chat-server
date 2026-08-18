@@ -35,6 +35,7 @@ snapshot() ->
     MapServerQueues = maps:from_list([
         {MapId, process_queue_length(whereis(map_server:server_name(MapId)))}
      || MapId <- map_server:map_ids()]),
+    MapServerQueueMax = queue_length_max(maps:values(MapServerQueues)),
     {WorkerCount, WorkerQueueMax} =
         queue_stats(child_pids(channel_sup, world_broadcast_worker)),
     ChannelBatchStats = channel_batch_stats(),
@@ -50,6 +51,7 @@ snapshot() ->
       channel_count => ChannelCount,
       channel_queue_max => ChannelQueueMax,
       map_server_count => MapServerCount,
+      map_server_queue_max => MapServerQueueMax,
       map_server_queues => MapServerQueues,
       world_worker_count => WorkerCount,
       world_worker_queue_max => WorkerQueueMax,
@@ -176,3 +178,13 @@ process_queue_length(Pid) when is_pid(Pid) ->
     end;
 process_queue_length(_Pid) ->
     undefined.
+
+queue_length_max(QueueLengths) ->
+    queue_length_max(QueueLengths, 0).
+
+queue_length_max([], Max) ->
+    Max;
+queue_length_max([undefined | Rest], Max) ->
+    queue_length_max(Rest, Max);
+queue_length_max([Length | Rest], Max) ->
+    queue_length_max(Rest, erlang:max(Length, Max)).
