@@ -153,6 +153,24 @@ role_down_removes_member_and_cell_test_() ->
          end
      end}.
 
+map_nearby_clips_corner_and_edge_once_test_() ->
+    {setup,
+     fun start_map/0,
+     fun stop_map/1,
+     fun(MapPid) ->
+         fun() ->
+             assert_nearby_case(
+                 MapPid, {11, {0, 0}},
+                 [{12, {0, 1}}, {13, {1, 0}}, {14, {1, 1}}],
+                 {15, {0, 2}}),
+             assert_nearby_case(
+                 MapPid, {21, {0, 50}},
+                 [{22, {0, 49}}, {23, {0, 51}}, {24, {1, 49}},
+                  {25, {1, 50}}, {26, {1, 51}}],
+                 {27, {2, 50}})
+         end
+     end}.
+
 map_chat_protocol_roundtrip_test() ->
     Content = <<"hello">>,
     ?assertEqual(
@@ -198,6 +216,78 @@ role_proxy_loop(Parent, Label) ->
 
 stop_role_proxies(RolePids) ->
     lists:foreach(fun(RolePid) -> exit(RolePid, kill) end, RolePids).
+
+start_roles(Specs) ->
+    [{RoleId, Position, start_role_proxy(RoleId)}
+     || {RoleId, Position} <- Specs].
+
+join_roles(MapPid, Roles) ->
+    lists:foreach(
+        fun({RoleId, Position, RolePid}) ->
+            ?assertEqual({ok, {10, Position}},
+                         map_server:join(MapPid, RoleId, RolePid, Position))
+        end,
+        Roles).
+
+stop_roles(Roles) ->
+    stop_role_proxies([RolePid || {_, _, RolePid} <- Roles]).
+
+role_pid(RoleId, Roles) ->
+    {RoleId, _, RolePid} = lists:keyfind(RoleId, 1, Roles),
+    RolePid.
+
+assert_nearby_case(MapPid, {SenderId, SenderPosition} = Sender,
+                   Neighbors, {FarId, _} = Far) ->
+    Nearby = [Sender | Neighbors],
+    Roles = start_roles(Nearby ++ [Far]),
+    try
+        join_roles(MapPid, Roles),
+        ?assertEqual(ok,
+                     map_server:send_nearby(
+                         MapPid, role_pid(SenderId, Roles),
+                         <<"sender">>, <<"hello">>)),
+        assert_map_result(
+            SenderId, MapPid, send_nearby, {ok, length(Nearby)}),
+        NearbyIds = [RoleId || {RoleId, _} <- Nearby],
+        assert_nearby_pushes(
+            NearbyIds, SenderId, <<"sender">>, SenderPosition, <<"hello">>),
+        assert_no_pushes([FarId | NearbyIds])
+    after
+        stop_roles(Roles)
+    end.
+
+assert_nearby_chat(Label, RoleId, RoleName, Position, Content) ->
+    {ok, Packet} = receive_nearby_push(Label, 500),
+    ?assertEqual(
+        {ok, {nearby_push,
+              #{sender_role_id => RoleId,
+                sender_role_name => RoleName,
+                position => Position,
+                content => Content}}},
+        chat_client_protocol:decode_packet(Packet)).
+
+assert_nearby_pushes(Labels, RoleId, RoleName, Position, Content) ->
+    lists:foreach(
+        fun(Label) ->
+            assert_nearby_chat(
+                Label, RoleId, RoleName, Position, Content)
+        end,
+        Labels).
+
+assert_no_pushes(Labels) ->
+    lists:foreach(
+        fun(Label) ->
+            ?assertEqual(timeout, receive_nearby_push(Label, 100))
+        end,
+        Labels).
+
+receive_nearby_push(Label, Timeout) ->
+    receive
+        {Label, {'$gen_cast', {push_batch, Packet}}} ->
+            {ok, Packet}
+    after Timeout ->
+        timeout
+    end.
 
 assert_map_chat(Label, MapId, RoleId, RoleName, Content) ->
     {ok, Packet} = receive_push(Label, 500),

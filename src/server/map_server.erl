@@ -286,13 +286,12 @@ teleport_member(RolePid, NewPosition, #{members := Members} = State) ->
     end.
 
 nearby_targets({X, Y}, Cells) ->
-    Coordinates = [{NearbyX, NearbyY}
-                   || NearbyX <- lists:seq(erlang:max(0, X - 1),
-                                           erlang:min(?MAP_SIZE - 1, X + 1)),
-                      NearbyY <- lists:seq(erlang:max(0, Y - 1),
-                                           erlang:min(?MAP_SIZE - 1, Y + 1))],
-    lists:usort(lists:append([maps:get(Coordinate, Cells, [])
-                              || Coordinate <- Coordinates])).
+    [RolePid
+     || NearbyX <- lists:seq(erlang:max(0, X - 1),
+                             erlang:min(?MAP_SIZE - 1, X + 1)),
+        NearbyY <- lists:seq(erlang:max(0, Y - 1),
+                             erlang:min(?MAP_SIZE - 1, Y + 1)),
+        RolePid <- maps:get({NearbyX, NearbyY}, Cells, [])].
 
 add_cell(Position, RolePid, Cells) ->
     case maps:find(Position, Cells) of
