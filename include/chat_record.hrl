@@ -21,16 +21,7 @@
     member_monitors = #{},
     packets = [],
     batch_size = 0,
-    batch_generation = 0,
     flush_ref = undefined
-}).
-
-%% batch_generation/batch_start 标记成员从当前批次的哪个位置开始收消息。
--record(channel_member, {
-    role_pid,
-    monitor_ref,
-    batch_generation = 0,
-    batch_start = 0
 }).
 
 -record(world_channel_member, {

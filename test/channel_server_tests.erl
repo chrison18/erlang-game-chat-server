@@ -41,6 +41,51 @@ public_channel_membership_and_batch_test_() ->
          end
      end}.
 
+public_channel_uses_flush_members_test_() ->
+    {setup,
+     fun start_public_channel/0,
+     fun stop_public_channel/1,
+     fun(ChannelPid) ->
+         fun() ->
+             Owner = self(),
+             RolePid = spawn(fun() -> role_proxy(Owner) end),
+             try
+                 ?assertEqual({ok, 2},
+                              channel_server:join(2, 101, self())),
+                 ?assertEqual({ok, 2},
+                              channel_server:send_channel(
+                                  2, 101, <<"alice">>, <<"before join">>)),
+                 ?assertEqual({ok, 2},
+                              channel_server:join(2, 202, RolePid)),
+                 flush_channel_batch(ChannelPid),
+                 ExpectedBeforeJoin =
+                     {ok, {channel_push_batch,
+                           [#{channel_id => 2,
+                              sender_role_id => 101,
+                              sender_role_name => <<"alice">>,
+                              content => <<"before join">>}]}},
+                 ?assertEqual(ExpectedBeforeJoin, receive_push()),
+                 ?assertEqual(ExpectedBeforeJoin, receive_push(RolePid)),
+
+                 ?assertEqual({ok, 2},
+                              channel_server:send_channel(
+                                  2, 101, <<"alice">>, <<"before leave">>)),
+                 ?assertEqual({ok, 2}, channel_server:leave(2, 202)),
+                 flush_channel_batch(ChannelPid),
+                 ?assertEqual(
+                     {ok, {channel_push_batch,
+                           [#{channel_id => 2,
+                              sender_role_id => 101,
+                              sender_role_name => <<"alice">>,
+                              content => <<"before leave">>}]}},
+                     receive_push()),
+                 ?assertEqual(timeout, receive_push(RolePid))
+             after
+                 exit(RolePid, kill)
+             end
+         end
+     end}.
+
 start_public_channel() ->
     create_test_table(online_roles),
     create_test_table(channel_batch_metrics),
@@ -68,4 +113,19 @@ receive_push() ->
             chat_client_protocol:decode_packet(Packet)
     after 500 ->
         timeout
+    end.
+
+receive_push(RolePid) ->
+    receive
+        {RolePid, {'$gen_cast', {push_batch, Packet}}} ->
+            chat_client_protocol:decode_packet(Packet)
+    after 500 ->
+        timeout
+    end.
+
+role_proxy(Owner) ->
+    receive
+        Message ->
+            Owner ! {self(), Message},
+            role_proxy(Owner)
     end.

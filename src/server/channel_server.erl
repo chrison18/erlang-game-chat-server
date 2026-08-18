@@ -127,21 +127,13 @@ handle_call({join, RoleId, RolePid}, _From,
             #channel_state{channel_id = ChannelId,
                            channel_type = ChannelType,
                            members = Members,
-                           member_monitors = MemberMonitors,
-                           batch_generation = BatchGeneration,
-                           batch_size = BatchSize} = State) ->
+                           member_monitors = MemberMonitors} = State) ->
     case maps:is_key(RoleId, Members) of
         true ->
             {reply, {error, already_joined}, State};
         false ->
-            %% 新成员从当前 batch_size 开始，只接收加入之后进入本批的消息。
             MonitorRef = erlang:monitor(process, RolePid),
-            Member = #channel_member{
-                role_pid = RolePid,
-                monitor_ref = MonitorRef,
-                batch_generation = BatchGeneration,
-                batch_start = BatchSize
-            },
+            Member = #{role_pid => RolePid, monitor_ref => MonitorRef},
             ok = add_world_member(ChannelType, RoleId, RolePid),
             {reply, {ok, ChannelId},
              State#channel_state{
@@ -155,10 +147,7 @@ handle_call({leave, RoleId}, _From,
                            members = Members,
                            member_monitors = MemberMonitors} = State) ->
     case maps:take(RoleId, Members) of
-        {#channel_member{monitor_ref = MonitorRef} = Member,
-         RemainingMembers} ->
-            %% 只补发离开者应收的当前批次后缀，不打断其他成员的合批。
-            ok = send_pending(State, Member),
+        {#{monitor_ref := MonitorRef}, RemainingMembers} ->
             true = erlang:demonitor(MonitorRef, [flush]),
             ok = remove_world_member(ChannelType, RoleId),
             {reply, {ok, ChannelId},
@@ -267,77 +256,20 @@ flush_batch(Reason,
             #channel_state{channel_id = ChannelId,
                            members = Members,
                            packets = Packets,
-                           batch_size = BatchSize,
-                           batch_generation = BatchGeneration} = State) ->
+                           batch_size = BatchSize} = State) ->
     cancel_flush_timer(State),
-    %% generation 每次全批发送后递增，使跨批加入/离开的偏移不会串批。
     OrderedPackets = lists:reverse(Packets),
-    _ = maps:fold(
-        fun(_RoleId, Member, BatchAcc) ->
-            send_batch(BatchGeneration, BatchSize,
-                       OrderedPackets, Member, BatchAcc)
+    BatchPacket = chat_server_protocol:encode_channel_push_batch(
+        OrderedPackets),
+    maps:foreach(
+        fun(_RoleId, #{role_pid := RolePid}) ->
+            gen_server:cast(RolePid, {push_batch, BatchPacket})
         end,
-        #{},
         Members),
     record_channel_batch(ChannelId, Reason, BatchSize),
     State#channel_state{packets = [],
                         batch_size = 0,
-                        batch_generation = BatchGeneration + 1,
                         flush_ref = undefined}.
-
-send_batch(BatchGeneration, BatchSize, _OrderedPackets,
-           #channel_member{batch_generation = BatchGeneration,
-                           batch_start = BatchStart}, BatchAcc)
-  when BatchStart >= BatchSize ->
-    BatchAcc;
-send_batch(BatchGeneration, _BatchSize, OrderedPackets,
-           #channel_member{role_pid = RolePid,
-                           batch_generation = MemberGeneration,
-                           batch_start = MemberStart},
-           BatchPackets) ->
-    %% 稳定成员从 0 开始；本批中途加入者只取自己 batch_start 后的消息。
-    BatchStart = case MemberGeneration =:= BatchGeneration of
-        true -> MemberStart;
-        false -> 0
-    end,
-    {BatchPacket, NewBatchPackets} = batch_packet(
-        BatchStart, OrderedPackets, BatchPackets),
-    gen_server:cast(RolePid, {push_batch, BatchPacket}),
-    NewBatchPackets.
-
-send_pending(#channel_state{channel_id = ChannelId,
-                            packets = Packets,
-                            batch_size = BatchSize,
-                            batch_generation = BatchGeneration},
-             #channel_member{role_pid = RolePid,
-                             batch_generation = MemberGeneration,
-                             batch_start = MemberStart}) ->
-    BatchStart = case MemberGeneration =:= BatchGeneration of
-        true -> MemberStart;
-        false -> 0
-    end,
-    send_pending_batch(
-        ChannelId, RolePid, BatchStart, BatchSize, Packets).
-
-send_pending_batch(ChannelId, RolePid, BatchStart, BatchSize, Packets)
-  when BatchStart < BatchSize ->
-    BatchPacket = chat_server_protocol:encode_channel_push_batch(
-        lists:nthtail(BatchStart, lists:reverse(Packets))),
-    gen_server:cast(RolePid, {push_batch, BatchPacket}),
-    record_channel_batch(ChannelId, member_change, BatchSize - BatchStart),
-    ok;
-send_pending_batch(_ChannelId, _RolePid, _BatchStart, _BatchSize, _Packets) ->
-    ok.
-
-batch_packet(BatchStart, OrderedPackets, BatchPackets) ->
-    case maps:find(BatchStart, BatchPackets) of
-        {ok, BatchPacket} ->
-            {BatchPacket, BatchPackets};
-        error ->
-            BatchPacket = chat_server_protocol:encode_channel_push_batch(
-                lists:nthtail(BatchStart, OrderedPackets)),
-            {BatchPacket, BatchPackets#{BatchStart => BatchPacket}}
-    end.
 
 record_channel_batch(ChannelId, Reason, Size) ->
     Key = {ChannelId, Reason},
