@@ -124,7 +124,7 @@ map_chat_batches_packets_in_order_test_() ->
          end
      end}.
 
-role_down_removes_member_and_cell_test_() ->
+role_down_removes_role_cell_and_shard_test_() ->
     {setup,
      fun start_map/0,
      fun stop_map/1,
@@ -139,10 +139,11 @@ role_down_removes_member_and_cell_test_() ->
                               map_server:join(MapPid, 2, Role2, {11, 10})),
                  exit(Role2, kill),
                  State = wait_for_role_removed(MapPid, Role2, 50),
-                 Members = maps:get(members, State),
                  Cells = maps:get(cells, State),
-                 ?assertEqual(false, maps:is_key(Role2, Members)),
+                 Shards = maps:get(shards, State),
+                 ?assertEqual(undefined, map_server:debug_role(MapPid, Role2)),
                  ?assertEqual(false, maps:is_key({11, 10}, Cells)),
+                 ?assertEqual([Role1], maps:get({5, 3}, Shards)),
                  ?assertEqual(ok,
                               map_server:send_nearby(
                                   MapPid, Role1, <<"alice">>, <<"nearby">>)),
@@ -161,13 +162,13 @@ map_nearby_clips_corner_and_edge_once_test_() ->
          fun() ->
              assert_nearby_case(
                  MapPid, {11, {0, 0}},
-                 [{12, {0, 1}}, {13, {1, 0}}, {14, {1, 1}}],
-                 {15, {0, 2}}),
+                 [{12, {0, 5}}, {13, {3, 0}}, {14, {3, 5}}],
+                 {15, {0, 6}}),
              assert_nearby_case(
                  MapPid, {21, {0, 50}},
-                 [{22, {0, 49}}, {23, {0, 51}}, {24, {1, 49}},
-                  {25, {1, 50}}, {26, {1, 51}}],
-                 {27, {2, 50}})
+                 [{22, {0, 45}}, {23, {0, 53}}, {24, {3, 45}},
+                  {25, {3, 50}}, {26, {3, 53}}],
+                 {27, {4, 50}})
          end
      end}.
 
@@ -328,12 +329,10 @@ receive_push_packets(Label, Timeout) ->
 wait_for_role_removed(_MapPid, _RolePid, 0) ->
     ?assert(false);
 wait_for_role_removed(MapPid, RolePid, Attempts) ->
-    State = sys:get_state(MapPid),
-    Members = maps:get(members, State),
-    case maps:is_key(RolePid, Members) of
-        false ->
-            State;
-        true ->
+    case map_server:debug_role(MapPid, RolePid) of
+        undefined ->
+            map_server:debug_state(MapPid);
+        _RoleInfo ->
             receive after 10 -> ok end,
             wait_for_role_removed(MapPid, RolePid, Attempts - 1)
     end.

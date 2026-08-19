@@ -20,12 +20,16 @@
          teleport/3,
          send_nearby/4,
          send_map/4,
+         debug_state/1,
+         debug_role/2,
          operation_stats/0,
          operation_stats/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 -define(CALL_TIMEOUT_MS, 5000).
 -define(MAP_CHAT_BATCH_WINDOW_MS, 120).
+-define(SHARD_X_CELLS, 2).
+-define(SHARD_Y_CELLS, 3).
 
 child_spec(MapId) ->
     #{id => {map_server, MapId},
@@ -79,6 +83,12 @@ send_nearby(MapPid, RolePid, RoleName, Content) ->
 send_map(MapPid, RolePid, RoleName, Content) ->
     cast(MapPid, {send_map, RolePid, RoleName, Content}).
 
+debug_state(MapPid) ->
+    call(MapPid, debug_state).
+
+debug_role(MapPid, RolePid) ->
+    call(MapPid, {debug_role, RolePid}).
+
 operation_stats() ->
     lists:foldl(fun merge_map_operations/2, #{}, map_ids()).
 
@@ -117,113 +127,131 @@ operation_stats(MapId) ->
     end.
 
 init([MapId]) ->
-    {ok, #{map_id => MapId,
-           members => #{},
-           cells => #{},
-           map_packets => [],
-           map_flush_ref => undefined,
-           operations => #{}}}.
+    put(map_id, MapId),
+    put(cells, #{}),
+    put(shards, #{}),
+    put(map_packets, []),
+    put(map_flush_ref, undefined),
+    put(operations, #{}),
+    {ok, map_server_state}.
 
-handle_call({join, RoleId, RolePid, Position}, _From,
-            #{map_id := MapId,
-              members := Members,
-              cells := Cells} = State) ->
+handle_call({join, RoleId, RolePid, Position}, _From, _State) ->
+    MapId = get(map_id),
+    Cells = get(cells),
+    Shards = get(shards),
     StartedAt = erlang:monotonic_time(microsecond),
-    ReplyState = case {valid_position(Position), maps:is_key(RolePid, Members)} of
+    Reply = case {valid_position(Position), get({role, RolePid})} of
         {false, _} ->
-            {error, invalid_position, State};
-        {true, true} ->
-            {error, {already_in_map, MapId}, State};
-        {true, false} ->
+            {error, invalid_position};
+        {true, RoleInfo} when RoleInfo =/= undefined ->
+            {error, {already_in_map, MapId}};
+        {true, undefined} ->
             MonitorRef = erlang:monitor(process, RolePid),
-            Member = #{role_id => RoleId,
-                        position => Position,
-                        monitor_ref => MonitorRef},
-            NewMembers = Members#{RolePid => Member},
-            NewCells = add_cell(Position, RolePid, Cells),
-            {{ok, {MapId, Position}},
-             State#{members := NewMembers,
-                   cells := NewCells}}
+            Shard = position_shard(Position),
+            RoleInfo = #{role_id => RoleId,
+                         position => Position,
+                         shard => Shard,
+                         monitor_ref => MonitorRef},
+            put({role, RolePid}, RoleInfo),
+            put(cells, add_index(Position, RolePid, Cells)),
+            put(shards, add_index(Shard, RolePid, Shards)),
+            {ok, {MapId, Position}}
     end,
-    operation_reply(MapId, join, StartedAt, ReplyState);
-handle_call({leave, RolePid}, _From,
-            #{map_id := MapId,
-              members := Members,
-              cells := Cells} = State) ->
+    operation_reply(join, StartedAt, Reply);
+handle_call({leave, RolePid}, _From, _State) ->
+    MapId = get(map_id),
+    Cells = get(cells),
+    Shards = get(shards),
     StartedAt = erlang:monotonic_time(microsecond),
-    ReplyState = case maps:take(RolePid, Members) of
-        {#{position := Position,
-           monitor_ref := MonitorRef}, RemainingMembers} ->
+    Reply = case get({role, RolePid}) of
+        #{position := Position, shard := Shard,
+          monitor_ref := MonitorRef} ->
             true = erlang:demonitor(MonitorRef, [flush]),
-            NewState = State#{members := RemainingMembers,
-                              cells := remove_cell(Position, RolePid, Cells)},
-            {{ok, MapId}, NewState};
-        error ->
-            {{error, not_in_map}, State}
+            erase({role, RolePid}),
+            put(cells, remove_index(Position, RolePid, Cells)),
+            put(shards, remove_index(Shard, RolePid, Shards)),
+            {ok, MapId};
+        undefined ->
+            {error, not_in_map}
     end,
-    operation_reply(MapId, leave, StartedAt, ReplyState);
-handle_call(operation_stats, _From, #{operations := Operations} = State) ->
-    {reply, Operations, State};
-handle_call(_Request, _From, State) ->
-    {reply, {error, map_unavailable}, State}.
+    operation_reply(leave, StartedAt, Reply);
+handle_call(operation_stats, _From, _State) ->
+    {reply, get(operations), map_server_state};
+handle_call(debug_state, _From, _State) ->
+    {reply, debug_state(), map_server_state};
+handle_call({debug_role, RolePid}, _From, _State) ->
+    {reply, get({role, RolePid}), map_server_state};
+handle_call(_Request, _From, _State) ->
+    {reply, {error, map_unavailable}, map_server_state}.
 
-handle_cast({move, RolePid, Direction}, State) ->
+handle_cast({move, RolePid, Direction}, _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    {Result, NewState} = move_member(RolePid, Direction, State),
+    Result = move_member(RolePid, Direction),
     send_result(RolePid, move, Result),
-    operation_noreply(move, StartedAt, NewState);
-handle_cast({teleport, RolePid, NewPosition}, State) ->
+    operation_noreply(move, StartedAt);
+handle_cast({teleport, RolePid, NewPosition}, _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    {Result, NewState} = teleport_member(RolePid, NewPosition, State),
+    Result = teleport_member(RolePid, NewPosition),
     send_result(RolePid, teleport, Result),
-    operation_noreply(teleport, StartedAt, NewState);
+    operation_noreply(teleport, StartedAt);
 handle_cast({send_nearby, RolePid, RoleName, Content},
-            #{members := Members, cells := Cells} = State) ->
+            _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    case maps:find(RolePid, Members) of
-        {ok, #{role_id := MemberRoleId, position := Position}} ->
+    case get({role, RolePid}) of
+        #{role_id := MemberRoleId, position := Position,
+          shard := Shard} ->
             {X, Y} = Position,
             Packet = chat_server_protocol:encode_nearby_push(
                 MemberRoleId, RoleName, X, Y, Content),
-            Targets = nearby_targets(Position, Cells),
+            Targets = nearby_targets(Shard, get(shards)),
             send_result(RolePid, send_nearby, {ok, length(Targets)}),
             push(Targets, Packet),
-            operation_noreply(send_nearby, StartedAt, State);
+            operation_noreply(send_nearby, StartedAt);
         _ ->
             send_result(RolePid, send_nearby, {error, not_in_map}),
-            operation_noreply(send_nearby, StartedAt, State)
+            operation_noreply(send_nearby, StartedAt)
     end;
 handle_cast({send_map, RolePid, RoleName, Content},
-            #{map_id := MapId, members := Members} = State) ->
+            _State) ->
+    MapId = get(map_id),
     StartedAt = erlang:monotonic_time(microsecond),
-    case maps:find(RolePid, Members) of
-        {ok, #{role_id := MemberRoleId}} ->
+    case get({role, RolePid}) of
+        #{role_id := MemberRoleId} ->
             Packet = chat_server_protocol:encode_map_chat_push(
                 MapId, MemberRoleId, RoleName, Content),
-            NewState = enqueue_map_packet(Packet, State),
+            enqueue_map_packet(Packet),
             send_result(RolePid, send_map, {ok, MapId}),
-            operation_noreply(send_map, StartedAt, NewState);
+            operation_noreply(send_map, StartedAt);
         _ ->
             send_result(RolePid, send_map, {error, not_in_map}),
-            operation_noreply(send_map, StartedAt, State)
+            operation_noreply(send_map, StartedAt)
     end;
-handle_cast(_Request, State) ->
-    {noreply, State}.
+handle_cast(_Request, _State) ->
+    {noreply, map_server_state}.
 
 handle_info({timeout, Ref, flush_map_chat},
-            #{map_flush_ref := Ref} = State) ->
-    {noreply, flush_map_chat(State)};
-handle_info({'DOWN', MonitorRef, process, RolePid, _Reason},
-            #{members := Members, cells := Cells} = State) ->
-    case maps:find(RolePid, Members) of
-        {ok, #{position := Position, monitor_ref := MonitorRef}} ->
-            {noreply, State#{members := maps:remove(RolePid, Members),
-                             cells := remove_cell(Position, RolePid, Cells)}};
-        _ ->
-            {noreply, State}
+            _State) ->
+    case get(map_flush_ref) of
+        Ref ->
+            flush_map_chat(),
+            {noreply, map_server_state};
+        _Other ->
+            {noreply, map_server_state}
     end;
-handle_info(_Info, State) ->
-    {noreply, State}.
+handle_info({'DOWN', MonitorRef, process, RolePid, _Reason},
+            _State) ->
+    case get({role, RolePid}) of
+        #{position := Position, shard := Shard,
+          monitor_ref := MonitorRef} ->
+            erase({role, RolePid}),
+            put(cells, remove_index(Position, RolePid, get(cells))),
+            put(shards, remove_index(Shard, RolePid, get(shards))),
+            {noreply, map_server_state};
+        _ ->
+            {noreply, map_server_state}
+    end;
+handle_info(_Info, _State) ->
+    {noreply, map_server_state}.
 
 call(undefined, _Request) ->
     {error, map_unavailable};
@@ -239,30 +267,40 @@ cast(undefined, _Request) ->
 cast(MapPid, Request) when is_pid(MapPid) ->
     gen_server:cast(MapPid, Request).
 
-change_position(_RolePid, NewPosition, #{position := NewPosition}, State) ->
-    {{ok, NewPosition}, State};
-change_position(RolePid, NewPosition, #{position := OldPosition} = Member,
-                #{members := Members, cells := Cells} = State) ->
-    NewMember = Member#{position := NewPosition},
-    NewState = State#{members := Members#{RolePid => NewMember},
-                      cells := add_cell(
-                          NewPosition, RolePid,
-                          remove_cell(OldPosition, RolePid, Cells))},
-    {{ok, NewPosition}, NewState}.
+change_position(_RolePid, NewPosition, #{position := NewPosition}) ->
+    {ok, NewPosition};
+change_position(RolePid, NewPosition,
+                #{position := OldPosition, shard := OldShard} = RoleInfo) ->
+    Cells = get(cells),
+    NewShard = position_shard(NewPosition),
+    NewCells = add_index(
+        NewPosition, RolePid,
+        remove_index(OldPosition, RolePid, Cells)),
+    NewShards = change_shard(RolePid, OldShard, NewShard, get(shards)),
+    put({role, RolePid},
+        RoleInfo#{position := NewPosition, shard := NewShard}),
+    put(cells, NewCells),
+    put(shards, NewShards),
+    {ok, NewPosition}.
 
-move_member(RolePid, Direction, #{members := Members} = State) ->
-    case maps:find(RolePid, Members) of
-        error ->
-            {{error, not_in_map}, State};
-        {ok, #{position := Position} = Member} ->
+change_shard(_RolePid, Shard, Shard, Shards) ->
+    Shards;
+change_shard(RolePid, OldShard, NewShard, Shards) ->
+    add_index(NewShard, RolePid,
+              remove_index(OldShard, RolePid, Shards)).
+
+move_member(RolePid, Direction) ->
+    case get({role, RolePid}) of
+        undefined ->
+            {error, not_in_map};
+        #{position := Position} = Member ->
             case move_target(Direction, Position) of
                 invalid ->
-                    {{error, invalid_direction, Position}, State};
+                    {error, invalid_direction, Position};
                 Target ->
                     case valid_position(Target) of
-                        true -> change_position(
-                                    RolePid, Target, Member, State);
-                        false -> {{error, out_of_bounds, Position}, State}
+                        true -> change_position(RolePid, Target, Member);
+                        false -> {error, out_of_bounds, Position}
                     end
             end
     end.
@@ -273,50 +311,54 @@ move_target(left, {X, Y}) -> {X, Y - 1};
 move_target(right, {X, Y}) -> {X, Y + 1};
 move_target(_Direction, _Position) -> invalid.
 
-teleport_member(RolePid, NewPosition, #{members := Members} = State) ->
-    case maps:find(RolePid, Members) of
-        error ->
-            {{error, not_in_map}, State};
-        {ok, #{position := Position} = Member} ->
+teleport_member(RolePid, NewPosition) ->
+    case get({role, RolePid}) of
+        undefined ->
+            {error, not_in_map};
+        #{position := Position} = Member ->
             case valid_position(NewPosition) of
-                true -> change_position(
-                            RolePid, NewPosition, Member, State);
-                false -> {{error, invalid_position, Position}, State}
+                true -> change_position(RolePid, NewPosition, Member);
+                false -> {error, invalid_position, Position}
             end
     end.
 
-nearby_targets({X, Y}, Cells) ->
-    Positions =
+position_shard({X, Y}) ->
+    {X div ?SHARD_X_CELLS, Y div ?SHARD_Y_CELLS}.
+
+nearby_targets({ShardX, ShardY}, Shards) ->
+    MaxShardX = (?MAP_SIZE - 1) div ?SHARD_X_CELLS,
+    MaxShardY = (?MAP_SIZE - 1) div ?SHARD_Y_CELLS,
+    NearbyShards =
         [{NearbyX, NearbyY}
-         || NearbyX <- lists:seq(erlang:max(0, X - 1),
-                                 erlang:min(?MAP_SIZE - 1, X + 1)),
-            NearbyY <- lists:seq(erlang:max(0, Y - 1),
-                                 erlang:min(?MAP_SIZE - 1, Y + 1))],
-    nearby_targets(Positions, Cells, []).
+         || NearbyX <- lists:seq(erlang:max(0, ShardX - 1),
+                                 erlang:min(MaxShardX, ShardX + 1)),
+            NearbyY <- lists:seq(erlang:max(0, ShardY - 1),
+                                 erlang:min(MaxShardY, ShardY + 1))],
+    nearby_targets(NearbyShards, Shards, []).
 
-nearby_targets([], _Cells, Acc) ->
+nearby_targets([], _Shards, Acc) ->
     lists:reverse(Acc);
-nearby_targets([Position | Remaining], Cells, Acc) ->
-    RolePids = maps:get(Position, Cells, []),
-    nearby_targets(Remaining, Cells, lists:reverse(RolePids, Acc)).
+nearby_targets([Shard | Remaining], Shards, Acc) ->
+    RolePids = maps:get(Shard, Shards, []),
+    nearby_targets(Remaining, Shards, lists:reverse(RolePids, Acc)).
 
-add_cell(Position, RolePid, Cells) ->
-    case maps:find(Position, Cells) of
+add_index(Key, RolePid, Index) ->
+    case maps:find(Key, Index) of
         {ok, RolePids} ->
-            Cells#{Position => [RolePid | RolePids]};
+            Index#{Key => [RolePid | RolePids]};
         error ->
-            Cells#{Position => [RolePid]}
+            Index#{Key => [RolePid]}
     end.
 
-remove_cell(Position, RolePid, Cells) ->
-    case maps:find(Position, Cells) of
+remove_index(Key, RolePid, Index) ->
+    case maps:find(Key, Index) of
         {ok, RolePids} ->
             case lists:delete(RolePid, RolePids) of
-                [] -> maps:remove(Position, Cells);
-                Remaining -> Cells#{Position => Remaining}
+                [] -> maps:remove(Key, Index);
+                Remaining -> Index#{Key => Remaining}
             end;
         error ->
-            Cells
+            Index
     end.
 
 push(Targets, Packet) ->
@@ -325,51 +367,72 @@ push(Targets, Packet) ->
         Targets),
     ok.
 
-enqueue_map_packet(Packet,
-                   #{map_packets := Packets,
-                     map_flush_ref := undefined} = State) ->
-    Ref = erlang:start_timer(
-        ?MAP_CHAT_BATCH_WINDOW_MS, self(), flush_map_chat),
-    State#{map_packets := [Packet | Packets], map_flush_ref := Ref};
-enqueue_map_packet(Packet, #{map_packets := Packets} = State) ->
-    State#{map_packets := [Packet | Packets]}.
+enqueue_map_packet(Packet) ->
+    Packets = get(map_packets),
+    put(map_packets, [Packet | Packets]),
+    case get(map_flush_ref) of
+        undefined ->
+            Ref = erlang:start_timer(
+                ?MAP_CHAT_BATCH_WINDOW_MS, self(), flush_map_chat),
+            put(map_flush_ref, Ref);
+        _Ref ->
+            ok
+    end.
 
-flush_map_chat(#{map_id := MapId,
-                 map_packets := Packets,
-                 members := Members} = State) ->
+flush_map_chat() ->
+    MapId = get(map_id),
+    Packets = get(map_packets),
+    RolePids = map_role_pids(get(cells)),
     StartedAt = erlang:monotonic_time(microsecond),
     OrderedPackets = lists:reverse(Packets),
-    maps:foreach(
-        fun(RolePid, _Member) ->
+    lists:foreach(
+        fun(RolePid) ->
             gen_server:cast(RolePid, {push_packets, OrderedPackets})
         end,
-        Members),
-    record_map_batch(MapId, length(Packets), maps:size(Members),
+        RolePids),
+    record_map_batch(MapId, length(Packets), length(RolePids),
                      erlang:monotonic_time(microsecond) - StartedAt),
-    State#{map_packets := [], map_flush_ref := undefined}.
+    put(map_packets, []),
+    put(map_flush_ref, undefined),
+    ok.
+
+map_role_pids(Cells) ->
+    maps:fold(fun(_Position, RolePids, Acc) ->
+                      lists:reverse(RolePids, Acc)
+              end, [], Cells).
 
 send_result(RolePid, Operation, Result) ->
     gen_server:cast(RolePid, {map_result, self(), Operation, Result}).
 
-operation_reply(MapId, Operation, StartedAt, {Reply, State}) ->
-    {reply, Reply, record_operation(MapId, Operation, StartedAt, State)}.
+operation_reply(Operation, StartedAt, Reply) ->
+    record_operation(Operation, StartedAt),
+    {reply, Reply, map_server_state}.
 
-operation_noreply(Operation, StartedAt, State) ->
-    MapId = maps:get(map_id, State),
-    {noreply, record_operation(MapId, Operation, StartedAt, State)}.
+operation_noreply(Operation, StartedAt) ->
+    record_operation(Operation, StartedAt),
+    {noreply, map_server_state}.
 
-record_operation(MapId, Operation, StartedAt, State) ->
+record_operation(Operation, StartedAt) ->
+    MapId = get(map_id),
     ElapsedUs = erlang:monotonic_time(microsecond) - StartedAt,
     record_map_operation(MapId, Operation, ElapsedUs),
-    Operations = maps:get(operations, State),
+    Operations = get(operations),
     Previous = maps:get(Operation, Operations,
                         #{count => 0, total_us => 0, max_us => 0}),
     Updated = Previous#{count := maps:get(count, Previous) + 1,
                         total_us := maps:get(total_us, Previous) + ElapsedUs,
                         max_us := erlang:max(maps:get(max_us, Previous),
                                              ElapsedUs)},
-    State#{map_id := MapId,
-           operations := Operations#{Operation => Updated}}.
+    put(operations, Operations#{Operation => Updated}),
+    ok.
+
+debug_state() ->
+    #{map_id => get(map_id),
+      cells => get(cells),
+      shards => get(shards),
+      map_packets => get(map_packets),
+      map_flush_ref => get(map_flush_ref),
+      operations => get(operations)}.
 
 record_map_operation(MapId, Operation, ElapsedUs) ->
     Key = {MapId, Operation},
