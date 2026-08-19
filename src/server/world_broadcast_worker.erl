@@ -50,7 +50,7 @@ handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
 handle_cast({broadcast, Packet}, State) ->
-    {NewState, BatchFull} = enqueue(Packet, State),
+    {NewState, BatchFull} = do_broadcast(Packet, State),
     case BatchFull of
         true ->
             {noreply, NewState, {continue, flush_batch}};
@@ -76,9 +76,9 @@ worker_pids() ->
         false -> error
     end.
 
-enqueue(Packet, #{packets := Packets,
-                  batch_size := BatchSize,
-                  flush_ref := undefined} = State) ->
+do_broadcast(Packet, #{packets := Packets,
+                       batch_size := BatchSize,
+                       flush_ref := undefined} = State) ->
     %% 每批首条消息启动一次 timer，满 256 条则由 continue 提前刷批。
     Ref = make_ref(),
     _ = erlang:send_after(?BATCH_WINDOW_MS, self(), {flush_batch, Ref}),
@@ -87,7 +87,7 @@ enqueue(Packet, #{packets := Packets,
             batch_size := NewSize,
             flush_ref := Ref},
      NewSize >= ?BATCH_MAX_MESSAGES};
-enqueue(Packet, #{packets := Packets, batch_size := BatchSize} = State) ->
+do_broadcast(Packet, #{packets := Packets, batch_size := BatchSize} = State) ->
     NewSize = BatchSize + 1,
     {State#{packets := [Packet | Packets], batch_size := NewSize},
      NewSize >= ?BATCH_MAX_MESSAGES}.

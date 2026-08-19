@@ -60,31 +60,42 @@ handle_call({set_feedback, Enabled}, _From, State)
   when is_boolean(Enabled) ->
     {reply, ok, State#{feedback := Enabled}};
 handle_call(Request, _From, State) ->
-    {stop, {unsupported_call, Request}, State}.
+    {reply, {error, {unsupported_call, Request}}, State}.
 
 handle_cast(list_channels, State) ->
     %% 外部 API 使用 cast，只表示命令进入客户端进程，不代表服务端业务成功。
-    {noreply, do_list_channels(State)};
+    NewState = do_list_channels(State),
+    {noreply, NewState};
 handle_cast({join_channel, ChannelId}, State) ->
-    {noreply, do_join_channel(ChannelId, State)};
+    NewState = do_join_channel(ChannelId, State),
+    {noreply, NewState};
 handle_cast({leave_channel, ChannelId}, State) ->
-    {noreply, do_leave_channel(ChannelId, State)};
+    NewState = do_leave_channel(ChannelId, State),
+    {noreply, NewState};
 handle_cast({send_channel, ChannelId, Content}, State) ->
-    {noreply, do_send_channel(ChannelId, Content, State)};
+    NewState = do_send_channel(ChannelId, Content, State),
+    {noreply, NewState};
 handle_cast({send_private, TargetRoleName, Content}, State) ->
-    {noreply, do_send_private(TargetRoleName, Content, State)};
+    NewState = do_send_private(TargetRoleName, Content, State),
+    {noreply, NewState};
 handle_cast({move, Direction}, State) ->
-    {noreply, do_move(Direction, State)};
+    NewState = do_move(Direction, State),
+    {noreply, NewState};
 handle_cast({teleport, X, Y}, State) ->
-    {noreply, do_teleport(X, Y, State)};
+    NewState = do_teleport(X, Y, State),
+    {noreply, NewState};
 handle_cast({send_nearby, Content}, State) ->
-    {noreply, do_send_nearby(Content, State)};
+    NewState = do_send_nearby(Content, State),
+    {noreply, NewState};
 handle_cast({join_map, MapId}, State) ->
-    {noreply, do_join_map(MapId, State)};
+    NewState = do_join_map(MapId, State),
+    {noreply, NewState};
 handle_cast(leave_map, State) ->
-    {noreply, do_leave_map(State)};
+    NewState = do_leave_map(State),
+    {noreply, NewState};
 handle_cast({send_map, Content}, State) ->
-    {noreply, do_send_map(Content, State)};
+    NewState = do_send_map(Content, State),
+    {noreply, NewState};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
