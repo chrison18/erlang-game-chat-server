@@ -197,6 +197,17 @@ handle_cast({teleport, RolePid, NewPosition}, _State) ->
 handle_cast({send_nearby, RolePid, RoleName, Content},
             _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
+    do_send_nearby(RolePid, RoleName, Content),
+    operation_noreply(send_nearby, StartedAt);
+handle_cast({send_map, RolePid, RoleName, Content},
+            _State) ->
+    StartedAt = erlang:monotonic_time(microsecond),
+    do_send_map(RolePid, RoleName, Content),
+    operation_noreply(send_map, StartedAt);
+handle_cast(_Request, _State) ->
+    {noreply, map_server_state}.
+
+do_send_nearby(RolePid, RoleName, Content) ->
     case get({role, RolePid}) of
         #{role_id := MemberRoleId, position := Position,
           shard := Shard} ->
@@ -206,28 +217,22 @@ handle_cast({send_nearby, RolePid, RoleName, Content},
             Targets = nearby_targets(Shard, get(shards)),
             send_result(RolePid, send_nearby, {ok, length(Targets)}),
             push(Targets, Packet),
-            operation_noreply(send_nearby, StartedAt);
+            ok;
         _ ->
-            send_result(RolePid, send_nearby, {error, not_in_map}),
-            operation_noreply(send_nearby, StartedAt)
-    end;
-handle_cast({send_map, RolePid, RoleName, Content},
-            _State) ->
+            send_result(RolePid, send_nearby, {error, not_in_map})
+    end.
+
+do_send_map(RolePid, RoleName, Content) ->
     MapId = get(map_id),
-    StartedAt = erlang:monotonic_time(microsecond),
     case get({role, RolePid}) of
         #{role_id := MemberRoleId} ->
             Packet = chat_server_protocol:encode_map_chat_push(
                 MapId, MemberRoleId, RoleName, Content),
             enqueue_map_packet(Packet),
-            send_result(RolePid, send_map, {ok, MapId}),
-            operation_noreply(send_map, StartedAt);
+            send_result(RolePid, send_map, {ok, MapId});
         _ ->
-            send_result(RolePid, send_map, {error, not_in_map}),
-            operation_noreply(send_map, StartedAt)
-    end;
-handle_cast(_Request, _State) ->
-    {noreply, map_server_state}.
+            send_result(RolePid, send_map, {error, not_in_map})
+    end.
 
 handle_info({timeout, Ref, flush_map_chat},
             _State) ->

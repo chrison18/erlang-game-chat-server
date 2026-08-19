@@ -20,22 +20,21 @@ handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
 handle_cast({push_packets, Packets}, #{socket := Socket} = State) ->
-    handle_push_packets(Socket, Packets, State);
+    do_push_packets(Socket, Packets),
+    {noreply, State};
 handle_cast({push_batch, Packet}, #{socket := Socket} = State) ->
-    handle_push_send(Socket, Packet, State);
+    do_push_batch(Socket, Packet),
+    {noreply, State};
 handle_cast({push_private, SenderRoleId, SenderRoleName, Content},
             #{socket := Socket} = State) ->
-    Packet = chat_server_protocol:encode_private_push(
-        SenderRoleId, SenderRoleName, Content),
-    handle_push_send(Socket, Packet, State);
+    do_push_private(Socket, SenderRoleId, SenderRoleName, Content),
+    {noreply, State};
 handle_cast({map_result, MapPid, Operation, Result},
             #{socket := Socket} = State) ->
-    case get(map_pid) of
-        MapPid -> handle_map_result(Operation, Result, Socket, State);
-        _CurrentMapPid -> {noreply, State}
-    end;
+    do_map_result(Socket, MapPid, Operation, Result),
+    {noreply, State};
 handle_cast({rejoin_channel, ChannelId}, State) ->
-    maybe_rejoin_channel(ChannelId),
+    do_rejoin_channel(ChannelId),
     {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -358,7 +357,7 @@ join_channels([ChannelId | Rest], RoleId) ->
         {error, _Reason} = Error -> Error
     end.
 
-maybe_rejoin_channel(ChannelId) ->
+do_rejoin_channel(ChannelId) ->
     case get(channel_ids) of
         #{ChannelId := true} ->
             _ = channel_server:join(ChannelId, get(role_id), self()),
@@ -395,58 +394,62 @@ send_private_message(TargetRoleName, SenderRoleId, SenderRoleName, Content) ->
             {error, target_offline}
     end.
 
-handle_map_result(move, {ok, Position} = Result, Socket, State) ->
-    put(position, Position),
-    handle_push_send(
-        Socket, chat_server_protocol:encode_move_result(Result), State);
-handle_map_result(move, {error, not_in_map} = Result, Socket, State) ->
-    clear_map_state(),
-    handle_push_send(
-        Socket, chat_server_protocol:encode_move_result(Result), State);
-handle_map_result(move, Result, Socket, State) ->
-    handle_push_send(
-        Socket, chat_server_protocol:encode_move_result(Result), State);
-handle_map_result(teleport, {ok, Position} = Result, Socket, State) ->
-    put(position, Position),
-    handle_push_send(
-        Socket, chat_server_protocol:encode_teleport_result(Result), State);
-handle_map_result(teleport, {error, not_in_map} = Result, Socket, State) ->
-    clear_map_state(),
-    handle_push_send(
-        Socket, chat_server_protocol:encode_teleport_result(Result), State);
-handle_map_result(teleport, Result, Socket, State) ->
-    handle_push_send(
-        Socket, chat_server_protocol:encode_teleport_result(Result), State);
-handle_map_result(send_nearby, Result, Socket, State) ->
-    handle_push_send(
-        Socket, chat_server_protocol:encode_nearby_send_result(Result), State);
-handle_map_result(send_map, Result, Socket, State) ->
-    handle_push_send(
-        Socket, chat_server_protocol:encode_map_chat_send_result(Result), State).
+do_push_packets(_Socket, []) ->
+    ok;
+do_push_packets(Socket, [Packet | Packets]) ->
+    case gen_tcp:send(Socket, Packet) of
+        ok -> do_push_packets(Socket, Packets);
+        {error, _Reason} -> ok
+    end.
+
+do_push_batch(Socket, Packet) ->
+    _ = gen_tcp:send(Socket, Packet),
+    ok.
+
+do_push_private(Socket, SenderRoleId, SenderRoleName, Content) ->
+    Packet = chat_server_protocol:encode_private_push(
+        SenderRoleId, SenderRoleName, Content),
+    _ = gen_tcp:send(Socket, Packet),
+    ok.
+
+do_map_result(Socket, MapPid, Operation, Result) ->
+    Packet = case {get(map_pid), Operation, Result} of
+        {MapPid, move, {ok, Position} = MoveResult} ->
+            put(position, Position),
+            chat_server_protocol:encode_move_result(MoveResult);
+        {MapPid, move, {error, not_in_map} = MoveResult} ->
+            clear_map_state(),
+            chat_server_protocol:encode_move_result(MoveResult);
+        {MapPid, move, MoveResult} ->
+            chat_server_protocol:encode_move_result(MoveResult);
+        {MapPid, teleport, {ok, Position} = TeleportResult} ->
+            put(position, Position),
+            chat_server_protocol:encode_teleport_result(TeleportResult);
+        {MapPid, teleport, {error, not_in_map} = TeleportResult} ->
+            clear_map_state(),
+            chat_server_protocol:encode_teleport_result(TeleportResult);
+        {MapPid, teleport, TeleportResult} ->
+            chat_server_protocol:encode_teleport_result(TeleportResult);
+        {MapPid, send_nearby, NearbyResult} ->
+            chat_server_protocol:encode_nearby_send_result(NearbyResult);
+        {MapPid, send_map, MapResult} ->
+            chat_server_protocol:encode_map_chat_send_result(MapResult);
+        {_CurrentMapPid, _Operation, _Result} ->
+            ignored
+    end,
+    case Packet of
+        ignored ->
+            ok;
+        _ ->
+            _ = gen_tcp:send(Socket, Packet),
+            ok
+    end.
 
 clear_map_state() ->
     erase(map_id),
     erase(map_pid),
     erase(position),
     ok.
-
-handle_push_send(Socket, Packet, State) ->
-    case send_packet(Socket, Packet) of
-        ok ->
-            {noreply, State};
-        {error, Reason} ->
-            {stop, Reason, State}
-    end.
-
-handle_push_packets(_Socket, [], State) ->
-    {noreply, State};
-handle_push_packets(Socket, [Packet | Packets], State) ->
-    case send_packet(Socket, Packet) of
-        ok ->
-            handle_push_packets(Socket, Packets, State);
-        {error, Reason} ->
-            {stop, Reason, State}
-    end.
 
 send_packet(Socket, Packet) ->
     case gen_tcp:send(Socket, Packet) of
