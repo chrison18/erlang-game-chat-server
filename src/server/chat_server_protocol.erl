@@ -22,6 +22,7 @@
          encode_map_leave_result/1,
          encode_map_chat_send_result/1,
          encode_map_chat_push/4,
+         encode_aoi_event/2,
          encode_error/2]).
 
 decode_request(<<?PROTO_LOGIN_REQUEST:16, NameLength:16, Data/binary>>) ->
@@ -247,6 +248,11 @@ encode_map_chat_push(MapId, SenderRoleId, SenderRoleName, Content) ->
     SenderNameLength = byte_size(SenderRoleName),
     <<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
       SenderNameLength:16, SenderRoleName/binary, Content/binary>>.
+
+encode_aoi_event(enter, RoleId) ->
+    <<?PROTO_AOI_EVENT_PUSH:16, ?AOI_EVENT_ENTER:8, RoleId:32>>;
+encode_aoi_event(leave, RoleId) ->
+    <<?PROTO_AOI_EVENT_PUSH:16, ?AOI_EVENT_LEAVE:8, RoleId:32>>.
 
 encode_private_send_result(ResultCode, TargetRoleName) ->
     TargetNameLength = byte_size(TargetRoleName),

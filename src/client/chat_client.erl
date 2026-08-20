@@ -294,6 +294,8 @@ handle_server_packet(Packet, State) ->
             handle_nearby_push(Message, State);
         {ok, {map_chat_push, Message}} ->
             handle_map_chat_push(Message, State);
+        {ok, {aoi_event, Message}} ->
+            handle_aoi_event(Message, State);
         {ok, Response} ->
             handle_response(Response, State);
         {error, Reason} ->
@@ -404,6 +406,17 @@ handle_map_chat_push(Message, #{feedback := true} = State) ->
     print_map_chat_push(Message),
     State;
 handle_map_chat_push(_Message, State) ->
+    State.
+
+handle_aoi_event(Message,
+                 #{mode := observer,
+                   observer_received := Received} = State) ->
+    print_aoi_event(Message),
+    State#{observer_received := Received + 1};
+handle_aoi_event(Message, #{feedback := true} = State) ->
+    print_aoi_event(Message),
+    State;
+handle_aoi_event(_Message, State) ->
     State.
 
 handle_channel_push_batch(Messages, State) ->
@@ -563,3 +576,6 @@ print_map_chat_push(#{map_id := MapId,
                       content := Content}) ->
     io:format("[map ~p] ~ts(~p): ~ts~n",
               [MapId, SenderRoleName, SenderRoleId, Content]).
+
+print_aoi_event(#{event := Event, role_id := RoleId}) ->
+    io:format("[aoi] ~p role=~p~n", [Event, RoleId]).

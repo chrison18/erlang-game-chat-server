@@ -33,6 +33,13 @@ handle_cast({map_result, MapPid, Operation, Result},
             #{socket := Socket} = State) ->
     do_map_result(Socket, MapPid, Operation, Result),
     {noreply, State};
+handle_cast({aoi_event, MapPid, Event, RoleId},
+            #{socket := Socket} = State) ->
+    do_aoi_event(Socket, MapPid, Event, RoleId),
+    {noreply, State};
+handle_cast({clear_aoi_leave_source, MapPid}, State) ->
+    do_clear_aoi_leave_source(MapPid),
+    {noreply, State};
 handle_cast({rejoin_channel, ChannelId}, State) ->
     do_rejoin_channel(ChannelId),
     {noreply, State};
@@ -250,11 +257,13 @@ handle_business_request(leave_map, Socket) ->
         undefined ->
             {error, not_in_map};
         MapId ->
-            case map_server:leave(get(map_pid), get(role_id)) of
+            MapPid = get(map_pid),
+            case map_server:leave(MapPid, get(role_id)) of
                 {ok, _MapId} = Result ->
-                    erase(map_id),
-                    erase(map_pid),
-                    erase(position),
+                    put(aoi_leave_source, MapPid),
+                    gen_server:cast(
+                        self(), {clear_aoi_leave_source, MapPid}),
+                    clear_map_state(),
                     Result;
                 {error, not_in_map} = Error ->
                     Error;
@@ -410,6 +419,30 @@ do_push_private(Socket, SenderRoleId, SenderRoleName, Content) ->
     Packet = chat_server_protocol:encode_private_push(
         SenderRoleId, SenderRoleName, Content),
     _ = gen_tcp:send(Socket, Packet),
+    ok.
+
+do_aoi_event(Socket, MapPid, Event, RoleId) ->
+    case should_forward_aoi(MapPid, Event) of
+        true ->
+            Packet = chat_server_protocol:encode_aoi_event(Event, RoleId),
+            _ = gen_tcp:send(Socket, Packet),
+            ok;
+        false ->
+            ok
+    end.
+
+should_forward_aoi(MapPid, Event) ->
+    case {get(map_pid), get(aoi_leave_source), Event} of
+        {MapPid, _LeaveSource, _Event} -> true;
+        {_CurrentMapPid, MapPid, leave} -> true;
+        {_CurrentMapPid, _LeaveSource, _Event} -> false
+    end.
+
+do_clear_aoi_leave_source(MapPid) ->
+    case get(aoi_leave_source) of
+        MapPid -> erase(aoi_leave_source);
+        _OtherMapPid -> ok
+    end,
     ok.
 
 do_map_result(Socket, MapPid, Operation, Result) ->

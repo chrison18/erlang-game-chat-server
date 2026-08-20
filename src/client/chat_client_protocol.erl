@@ -203,6 +203,15 @@ decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, MapId:16, SenderRoleId:32,
     end;
 decode_packet(<<?PROTO_MAP_CHAT_PUSH:16, _Data/binary>>) ->
     {error, invalid_packet};
+decode_packet(<<?PROTO_AOI_EVENT_PUSH:16, EventCode:8, RoleId:32>>) ->
+    case decode_aoi_event(EventCode) of
+        invalid ->
+            {error, invalid_packet};
+        Event ->
+            {ok, {aoi_event, #{event => Event, role_id => RoleId}}}
+    end;
+decode_packet(<<?PROTO_AOI_EVENT_PUSH:16, _Data/binary>>) ->
+    {error, invalid_packet};
 decode_packet(<<?PROTO_ERROR:16, RequestProtoId:16, ErrorCode:8>>) ->
     {ok, {server_error, RequestProtoId, decode_error(ErrorCode)}};
 decode_packet(<<ProtoId:16, _Data/binary>>) ->
@@ -214,6 +223,10 @@ decode_error(?ERROR_NOT_LOGGED_IN) -> not_logged_in;
 decode_error(?ERROR_INVALID_PACKET) -> invalid_packet;
 decode_error(?ERROR_UNKNOWN_PROTO) -> unknown_proto;
 decode_error(ErrorCode) -> {unknown_error, ErrorCode}.
+
+decode_aoi_event(?AOI_EVENT_ENTER) -> enter;
+decode_aoi_event(?AOI_EVENT_LEAVE) -> leave;
+decode_aoi_event(_EventCode) -> invalid.
 
 decode_channel_push_batch(0, <<>>, Messages) ->
     {ok, {channel_push_batch, lists:reverse(Messages)}};

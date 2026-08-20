@@ -145,6 +145,7 @@ handle_call({join, RoleId, RolePid, Position}, _From, _State) ->
         {true, undefined} ->
             MonitorRef = erlang:monitor(process, RolePid),
             Shard = position_shard(Position),
+            NearbyRoles = aoi_roles(nearby_shards(Shard), RoleId),
             set_role_pid(RoleId, RolePid),
             set_role_id_by_monitor_ref(MonitorRef, RoleId),
             set_role_position(RoleId, Position),
@@ -153,6 +154,7 @@ handle_call({join, RoleId, RolePid, Position}, _From, _State) ->
             set_role_ids([RoleId | get_role_ids()]),
             add_role_id_to_cell(Position, RoleId),
             add_role_id_to_shard(Shard, RoleId),
+            notify_aoi_mutual(enter, RoleId, RolePid, NearbyRoles),
             {ok, {MapId, Position}}
     end,
     operation_reply(join, StartedAt, Reply);
@@ -164,10 +166,10 @@ handle_call({leave, RoleId}, _From, _State) ->
             Position = get_role_position(RoleId),
             Shard = get_role_shard(RoleId),
             MonitorRef = get_role_monitor_ref(RoleId),
+            NearbyRoles = aoi_roles(nearby_shards(Shard), RoleId),
             true = erlang:demonitor(MonitorRef, [flush]),
-            delete_role(RoleId),
-            remove_role_id_from_cell(Position, RoleId),
-            remove_role_id_from_shard(Shard, RoleId),
+            remove_role_from_map(RoleId, Position, Shard),
+            notify_aoi_mutual(leave, RoleId, RolePid, NearbyRoles),
             {ok, MapId};
         _ ->
             {error, not_in_map}
@@ -184,12 +186,12 @@ handle_call(_Request, _From, _State) ->
 
 handle_cast({move, RoleId, Direction}, _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    Result = move_member(RoleId, Direction),
+    Result = do_move(RoleId, Direction),
     send_result(RoleId, move, Result),
     operation_noreply(move, StartedAt);
 handle_cast({teleport, RoleId, NewPosition}, _State) ->
     StartedAt = erlang:monotonic_time(microsecond),
-    Result = teleport_member(RoleId, NewPosition),
+    Result = do_teleport(RoleId, NewPosition),
     send_result(RoleId, teleport, Result),
     operation_noreply(teleport, StartedAt);
 handle_cast({send_nearby, RoleId, RoleName, Content},
@@ -247,9 +249,9 @@ handle_info({'DOWN', MonitorRef, process, _RolePid, _Reason},
         RoleId when RoleId =/= undefined ->
             Position = get_role_position(RoleId),
             Shard = get_role_shard(RoleId),
-            delete_role(RoleId),
-            remove_role_id_from_cell(Position, RoleId),
-            remove_role_id_from_shard(Shard, RoleId),
+            NearbyRoles = aoi_roles(nearby_shards(Shard), RoleId),
+            remove_role_from_map(RoleId, Position, Shard),
+            notify_aoi_others(leave, RoleId, NearbyRoles),
             {noreply, map_server_state};
         undefined ->
             {noreply, map_server_state}
@@ -289,7 +291,7 @@ change_shard(RoleId, OldShard, NewShard) ->
     remove_role_id_from_shard(OldShard, RoleId),
     add_role_id_to_shard(NewShard, RoleId).
 
-move_member(RoleId, Direction) ->
+do_move(RoleId, Direction) ->
     case get_role_position(RoleId) of
         undefined ->
             {error, not_in_map};
@@ -299,7 +301,9 @@ move_member(RoleId, Direction) ->
                     {error, invalid_direction, Position};
                 Target ->
                     case valid_position(Target) of
-                        true -> change_position(RoleId, Target, Position);
+                        true ->
+                            move_to_position(
+                                RoleId, Direction, Target, Position);
                         false -> {error, out_of_bounds, Position}
                     end
             end
@@ -311,39 +315,130 @@ move_target(left, {X, Y}) -> {X, Y - 1};
 move_target(right, {X, Y}) -> {X, Y + 1};
 move_target(_Direction, _Position) -> invalid.
 
-teleport_member(RoleId, NewPosition) ->
+do_teleport(RoleId, NewPosition) ->
     case get_role_position(RoleId) of
         undefined ->
             {error, not_in_map};
         Position ->
             case valid_position(NewPosition) of
-                true -> change_position(RoleId, NewPosition, Position);
+                true ->
+                    teleport_to_position(RoleId, NewPosition, Position);
                 false -> {error, invalid_position, Position}
             end
     end.
 
+move_to_position(RoleId, Direction, NewPosition, OldPosition) ->
+    OldShard = get_role_shard(RoleId),
+    NewShard = position_shard(NewPosition),
+    case NewShard of
+        OldShard ->
+            change_position(RoleId, NewPosition, OldPosition);
+        _ ->
+            {LeaveShards, EnterShards} =
+                move_aoi_shards(Direction, OldShard, NewShard),
+            LeaveRoles = aoi_roles(LeaveShards, RoleId),
+            EnterRoles = aoi_roles(EnterShards, RoleId),
+            RolePid = get_role_pid(RoleId),
+            Result = change_position(RoleId, NewPosition, OldPosition),
+            notify_aoi_mutual(leave, RoleId, RolePid, LeaveRoles),
+            notify_aoi_mutual(enter, RoleId, RolePid, EnterRoles),
+            Result
+    end.
+
+teleport_to_position(RoleId, NewPosition, OldPosition) ->
+    OldShard = get_role_shard(RoleId),
+    NewShard = position_shard(NewPosition),
+    OldNearbyShards = nearby_shards(OldShard),
+    NewNearbyShards = nearby_shards(NewShard),
+    LeaveRoles = aoi_roles(OldNearbyShards -- NewNearbyShards, RoleId),
+    EnterRoles = aoi_roles(NewNearbyShards -- OldNearbyShards, RoleId),
+    RolePid = get_role_pid(RoleId),
+    Result = change_position(RoleId, NewPosition, OldPosition),
+    notify_aoi_mutual(leave, RoleId, RolePid, LeaveRoles),
+    notify_aoi_mutual(enter, RoleId, RolePid, EnterRoles),
+    Result.
+
 position_shard({X, Y}) ->
     {X div ?SHARD_X_CELLS, Y div ?SHARD_Y_CELLS}.
 
-nearby_targets({ShardX, ShardY}) ->
+move_aoi_shards(up, {OldShardX, ShardY}, {NewShardX, ShardY}) ->
+    {shard_row(OldShardX + 1, ShardY),
+     shard_row(NewShardX - 1, ShardY)};
+move_aoi_shards(down, {OldShardX, ShardY}, {NewShardX, ShardY}) ->
+    {shard_row(OldShardX - 1, ShardY),
+     shard_row(NewShardX + 1, ShardY)};
+move_aoi_shards(left, {ShardX, OldShardY}, {ShardX, NewShardY}) ->
+    {shard_column(ShardX, OldShardY + 1),
+     shard_column(ShardX, NewShardY - 1)};
+move_aoi_shards(right, {ShardX, OldShardY}, {ShardX, NewShardY}) ->
+    {shard_column(ShardX, OldShardY - 1),
+     shard_column(ShardX, NewShardY + 1)}.
+
+shard_row(ShardX, CenterShardY) ->
+    [{ShardX, ShardY}
+     || ShardY <- lists:seq(CenterShardY - 1, CenterShardY + 1),
+        valid_shard({ShardX, ShardY})].
+
+shard_column(CenterShardX, ShardY) ->
+    [{ShardX, ShardY}
+     || ShardX <- lists:seq(CenterShardX - 1, CenterShardX + 1),
+        valid_shard({ShardX, ShardY})].
+
+valid_shard({ShardX, ShardY}) ->
     MaxShardX = (?MAP_SIZE - 1) div ?SHARD_X_CELLS,
     MaxShardY = (?MAP_SIZE - 1) div ?SHARD_Y_CELLS,
-    NearbyShards =
-        [{NearbyX, NearbyY}
-         || NearbyX <- lists:seq(erlang:max(0, ShardX - 1),
-                                 erlang:min(MaxShardX, ShardX + 1)),
-            NearbyY <- lists:seq(erlang:max(0, ShardY - 1),
-                                 erlang:min(MaxShardY, ShardY + 1))],
-    nearby_targets(NearbyShards, []).
+    ShardX >= 0 andalso ShardX =< MaxShardX andalso
+    ShardY >= 0 andalso ShardY =< MaxShardY.
 
-nearby_targets([], Acc) ->
+nearby_shards({ShardX, ShardY}) ->
+    MaxShardX = (?MAP_SIZE - 1) div ?SHARD_X_CELLS,
+    MaxShardY = (?MAP_SIZE - 1) div ?SHARD_Y_CELLS,
+    [{NearbyX, NearbyY}
+     || NearbyX <- lists:seq(erlang:max(0, ShardX - 1),
+                             erlang:min(MaxShardX, ShardX + 1)),
+        NearbyY <- lists:seq(erlang:max(0, ShardY - 1),
+                             erlang:min(MaxShardY, ShardY + 1))].
+
+nearby_targets(Shard) ->
+    [RolePid || {_RoleId, RolePid} <-
+                    roles_in_shards(nearby_shards(Shard))].
+
+roles_in_shards(Shards) ->
+    roles_in_shards(Shards, []).
+
+roles_in_shards([], Acc) ->
     lists:reverse(Acc);
-nearby_targets([Shard | Remaining], Acc) ->
+roles_in_shards([Shard | Remaining], Acc) ->
     RoleIds = get_role_ids_by_shard(Shard),
-    RolePids = [RolePid || RoleId <- RoleIds,
-                           RolePid <- [get_role_pid(RoleId)],
-                           is_pid(RolePid)],
-    nearby_targets(Remaining, lists:reverse(RolePids, Acc)).
+    Roles = [{RoleId, RolePid}
+             || RoleId <- RoleIds,
+                RolePid <- [get_role_pid(RoleId)],
+                is_pid(RolePid)],
+    roles_in_shards(Remaining, lists:reverse(Roles, Acc)).
+
+aoi_roles(Shards, ExcludedRoleId) ->
+    [Role || {RoleId, _RolePid} = Role <- roles_in_shards(Shards),
+             RoleId =/= ExcludedRoleId].
+
+notify_aoi_mutual(Event, RoleId, RolePid, Roles) ->
+    lists:foreach(
+        fun({OtherRoleId, OtherRolePid}) ->
+            send_aoi_event(OtherRolePid, Event, RoleId),
+            send_aoi_event(RolePid, Event, OtherRoleId)
+        end,
+        Roles),
+    ok.
+
+notify_aoi_others(Event, RoleId, Roles) ->
+    lists:foreach(
+        fun({_OtherRoleId, OtherRolePid}) ->
+            send_aoi_event(OtherRolePid, Event, RoleId)
+        end,
+        Roles),
+    ok.
+
+send_aoi_event(RolePid, Event, RoleId) ->
+    gen_server:cast(RolePid, {aoi_event, self(), Event, RoleId}).
 
 add_role_id_to_cell(Cell, RoleId) ->
     set_role_ids_by_cell(Cell, [RoleId | get_role_ids_by_cell(Cell)]).
@@ -362,6 +457,11 @@ remove_role_id_from_shard(Shard, RoleId) ->
         [] -> delete_role_ids_by_shard(Shard);
         Remaining -> set_role_ids_by_shard(Shard, Remaining)
     end.
+
+remove_role_from_map(RoleId, Position, Shard) ->
+    delete_role(RoleId),
+    remove_role_id_from_cell(Position, RoleId),
+    remove_role_id_from_shard(Shard, RoleId).
 
 get_role_ids_by_index_type(Type) ->
     maps:from_list(
