@@ -4,6 +4,8 @@
 
 -export([start/2,
          start_map/2,
+         start_aoi_move/2,
+         stop_aoi_move/2,
          start_observer/0,
          send_channel/3,
          send_private/3,
@@ -27,6 +29,27 @@ start(StartId, EndId) ->
 
 start_map(StartId, EndId) ->
     start(StartId, EndId, map_load).
+
+start_aoi_move(StartId, EndId) ->
+    start(StartId, EndId, aoi_move).
+
+stop_aoi_move(StartId, EndId)
+  when is_integer(StartId), StartId > 0,
+       is_integer(EndId), EndId >= StartId ->
+    case client_children() of
+        {ok, Children} ->
+            Clients = maps:from_list([
+                {ClientId, ClientPid}
+             || {{chat_client, ClientId}, ClientPid, worker, _Modules} <- Children,
+                is_integer(ClientId),
+                is_pid(ClientPid)
+            ]),
+            stop_aoi_move_clients(StartId, EndId, Clients, 0);
+        error ->
+            {error, client_supervisor_unavailable}
+    end;
+stop_aoi_move(_StartId, _EndId) ->
+    {error, invalid_client_range}.
 
 start(StartId, EndId, LoadMode)
   when is_integer(StartId), StartId > 0,
@@ -150,7 +173,8 @@ start_clients(ClientId, EndId, Host, Port,
     %% 串行启动便于准确返回首个失败 ClientId；已启动客户端按约定保留。
     ClientMode = case LoadMode of
         normal -> {normal, ClientId, StartId, EndId};
-        map_load -> map_load
+        map_load -> map_load;
+        aoi_move -> aoi_move
     end,
     case chat_client_sup:start_client(
              ClientId,
@@ -164,6 +188,26 @@ start_clients(ClientId, EndId, Host, Port,
                           LoadConfig, Count + 1);
         {error, Reason} ->
             {error, {client_start_failed, ClientId, Reason}}
+    end.
+
+stop_aoi_move_clients(ClientId, EndId, _Clients, Count)
+  when ClientId > EndId ->
+    {ok, Count};
+stop_aoi_move_clients(ClientId, EndId, Clients, Count) ->
+    case maps:find(ClientId, Clients) of
+        {ok, ClientPid} ->
+            try gen_server:call(ClientPid, stop_aoi_move) of
+                ok ->
+                    stop_aoi_move_clients(
+                        ClientId + 1, EndId, Clients, Count + 1);
+                {error, Reason} ->
+                    {error, {client_stop_failed, ClientId, Reason}}
+            catch
+                exit:Reason ->
+                    {error, {client_stop_failed, ClientId, Reason}}
+            end;
+        error ->
+            {error, {client_not_found, ClientId}}
     end.
 
 existing_client(StartId, EndId) ->

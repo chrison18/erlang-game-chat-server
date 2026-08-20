@@ -11,6 +11,8 @@
 
 -define(AUTO_SEND_INTERVAL_MS, 1000).
 -define(OBSERVER_REPORT_INTERVAL_MS, 1000).
+-define(AOI_MOVE_CYCLE_MS, 1000).
+-define(AOI_MOVES_PER_CYCLE, 10).
 -define(MOVEMENT_SCHEDULE,
         [{30, move},
          {40, move},
@@ -59,6 +61,10 @@ handle_call(location, _From,
 handle_call({set_feedback, Enabled}, _From, State)
   when is_boolean(Enabled) ->
     {reply, ok, State#{feedback := Enabled}};
+handle_call(stop_aoi_move, _From, #{mode := aoi_move} = State) ->
+    {reply, ok, State#{mode := aoi_move_stopped}};
+handle_call(stop_aoi_move, _From, #{mode := aoi_move_stopped} = State) ->
+    {reply, ok, State};
 handle_call(Request, _From, State) ->
     {reply, {error, {unsupported_call, Request}}, State}.
 
@@ -122,6 +128,23 @@ handle_info({movement_action, map_chat},
     ActionState = do_send_map(Content, State),
     schedule_movement_cycle(),
     {noreply, ActionState#{action_seq := Sequence + 1}};
+handle_info(start_aoi_move, #{mode := aoi_move} = State) ->
+    {noreply, schedule_aoi_move_cycle(State)};
+handle_info({aoi_move_action, CycleRef, _Offset, ExpiresAt},
+            #{mode := aoi_move,
+              aoi_move_cycle_ref := CycleRef,
+              action_seq := Sequence} = State) ->
+    case erlang:monotonic_time(millisecond) < ExpiresAt of
+        true ->
+            ActionState = do_move(random_direction(), State),
+            {noreply, ActionState#{action_seq := Sequence + 1}};
+        false ->
+            {noreply, State}
+    end;
+handle_info({aoi_move_cycle, CycleRef},
+            #{mode := aoi_move,
+              aoi_move_cycle_ref := CycleRef} = State) ->
+    {noreply, schedule_aoi_move_cycle(State)};
 handle_info(observer_report,
             #{mode := observer,
               role_name := RoleName,
@@ -442,6 +465,9 @@ start_mode_after_login(#{mode := normal} = State) ->
 start_mode_after_login(#{mode := map_load} = State) ->
     schedule_movement_cycle(),
     State;
+start_mode_after_login(#{mode := aoi_move} = State) ->
+    schedule_aoi_move_start(),
+    State;
 start_mode_after_login(State) ->
     State.
 
@@ -456,6 +482,41 @@ schedule_movement_cycle() ->
             _ = erlang:send_after(Delay, self(), {movement_action, Action})
         end,
         ?MOVEMENT_SCHEDULE),
+    ok.
+
+schedule_aoi_move_start() ->
+    InitialPhase = rand:uniform(?AOI_MOVE_CYCLE_MS) - 1,
+    _ = erlang:send_after(InitialPhase, self(), start_aoi_move),
+    ok.
+
+schedule_aoi_move_cycle(State) ->
+    CycleRef = make_ref(),
+    StartedAt = erlang:monotonic_time(millisecond),
+    Offsets = random_unique_offsets(?AOI_MOVES_PER_CYCLE, #{}),
+    schedule_aoi_move_actions(CycleRef, StartedAt, Offsets),
+    _ = erlang:send_after(
+        ?AOI_MOVE_CYCLE_MS, self(), {aoi_move_cycle, CycleRef}),
+    State#{aoi_move_cycle_ref => CycleRef}.
+
+random_unique_offsets(0, Offsets) ->
+    lists:sort(maps:keys(Offsets));
+random_unique_offsets(Count, Offsets) ->
+    Offset = rand:uniform(?AOI_MOVE_CYCLE_MS) - 1,
+    case maps:is_key(Offset, Offsets) of
+        true -> random_unique_offsets(Count, Offsets);
+        false -> random_unique_offsets(Count - 1, Offsets#{Offset => true})
+    end.
+
+schedule_aoi_move_actions(CycleRef, StartedAt, Offsets) ->
+    Expirations = tl(Offsets) ++ [?AOI_MOVE_CYCLE_MS],
+    lists:foreach(
+        fun({Offset, Expiration}) ->
+            ExpiresAt = StartedAt + Expiration,
+            _ = erlang:send_after(
+                Offset, self(),
+                {aoi_move_action, CycleRef, Offset, ExpiresAt})
+        end,
+        lists:zip(Offsets, Expirations)),
     ok.
 
 schedule_observer_report() ->
@@ -480,6 +541,9 @@ mode_state({normal, ClientId, StartId, EndId}, State) ->
            channel_ids => []};
 mode_state(map_load, State) ->
     State#{mode => map_load,
+           channel_ids => []};
+mode_state(aoi_move, State) ->
+    State#{mode => aoi_move,
            channel_ids => []};
 mode_state(manual, State) ->
     State#{mode => manual,

@@ -31,6 +31,8 @@
 ok = chat_load_test:start_observer().
 {ok, 2} = chat_load_test:start(1, 2).
 {ok, 2} = chat_load_test:start_map(1001, 1002).
+{ok, 1000} = chat_load_test:start_aoi_move(2001, 3000).
+{ok, 1000} = chat_load_test:stop_aoi_move(2001, 3000).
 ok = chat_load_test:send_channel(1, 1, <<"hello">>).
 ok = chat_load_test:send_private(1, 2, <<"hello">>).
 ok = chat_load_test:set_feedback(1, true).
@@ -57,6 +59,11 @@ ok = chat_load_test:join_map(1, 2).
 登录成功后，每个 1000ms 周期触发 10 次不规则移动动作：固定在第
 `30、40、45、200、210、220、230、900、950、980ms` 触发随机方向的 `move`，
 并在第 `1000ms` 发送一次地图聊天。动作时间固定，移动方向随机，聊天内容包含客户端名和动作序号。
+
+`start_aoi_move/2` 启动纯 AOI 移动负载。每个客户端登录后使用独立随机初始相位，
+每秒重新生成 10 个 `0..999ms` 内的唯一随机偏移，并且只发送随机方向 `move`。
+延迟到下一个动作时间之后的动作会被丢弃，不集中补发。`stop_aoi_move/2` 停止指定
+范围的后续动作和周期，保留 TCP 连接并继续接收、解码服务端消息。
 
 登录默认随机进入地图 `1`。一个角色同时只能处于一张地图；地图聊天只广播给当前地图
 玩家。地图按 X 方向 2 个、Y 方向 3 个逻辑格划分 AOI 分片，周围聊天查询玩家
