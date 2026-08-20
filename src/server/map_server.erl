@@ -363,6 +363,12 @@ remove_role_id_from_shard(Shard, RoleId) ->
         Remaining -> set_role_ids_by_shard(Shard, Remaining)
     end.
 
+get_role_ids_by_index_type(Type) ->
+    maps:from_list(
+        [{Key, RoleIds}
+         || {{IndexType, Key}, RoleIds} <- erlang:get(),
+            IndexType =:= Type]).
+
 get_role_ids_by_cell(Cell) ->
     case erlang:get({cell, Cell}) of
         undefined -> [];
@@ -398,11 +404,19 @@ set_role_id_by_monitor_ref(MonitorRef, RoleId) ->
     erlang:put({role_id, MonitorRef}, RoleId),
     ok.
 
+delete_role_id_by_monitor_ref(MonitorRef) ->
+    erlang:erase({role_id, MonitorRef}),
+    ok.
+
 get_role_pid(RoleId) ->
     erlang:get({role_pid, RoleId}).
 
 set_role_pid(RoleId, RolePid) ->
     erlang:put({role_pid, RoleId}, RolePid),
+    ok.
+
+delete_role_pid(RoleId) ->
+    erlang:erase({role_pid, RoleId}),
     ok.
 
 get_role_position(RoleId) ->
@@ -412,11 +426,19 @@ set_role_position(RoleId, Position) ->
     erlang:put({position, RoleId}, Position),
     ok.
 
+delete_role_position(RoleId) ->
+    erlang:erase({position, RoleId}),
+    ok.
+
 get_role_shard(RoleId) ->
     erlang:get({role_shard, RoleId}).
 
 set_role_shard(RoleId, Shard) ->
     erlang:put({role_shard, RoleId}, Shard),
+    ok.
+
+delete_role_shard(RoleId) ->
+    erlang:erase({role_shard, RoleId}),
     ok.
 
 get_role_monitor_ref(RoleId) ->
@@ -426,13 +448,17 @@ set_role_monitor_ref(RoleId, MonitorRef) ->
     erlang:put({monitor_ref, RoleId}, MonitorRef),
     ok.
 
+delete_role_monitor_ref(RoleId) ->
+    erlang:erase({monitor_ref, RoleId}),
+    ok.
+
 delete_role(RoleId) ->
     MonitorRef = get_role_monitor_ref(RoleId),
-    erlang:erase({role_pid, RoleId}),
-    erlang:erase({role_id, MonitorRef}),
-    erlang:erase({position, RoleId}),
-    erlang:erase({role_shard, RoleId}),
-    erlang:erase({monitor_ref, RoleId}),
+    delete_role_pid(RoleId),
+    delete_role_id_by_monitor_ref(MonitorRef),
+    delete_role_position(RoleId),
+    delete_role_shard(RoleId),
+    delete_role_monitor_ref(RoleId),
     set_role_ids(lists:delete(RoleId, get_role_ids())),
     ok.
 
@@ -523,17 +549,11 @@ record_operation(Operation, StartedAt) ->
 
 debug_state() ->
     #{map_id => get_map_id(),
-      cells => debug_index(cell),
-      shards => debug_index(shard),
+      cells => get_role_ids_by_index_type(cell),
+      shards => get_role_ids_by_index_type(shard),
       map_packets => get_map_packets(),
       map_flush_ref => get_map_flush_ref(),
       operations => get_operations()}.
-
-debug_index(Type) ->
-    maps:from_list(
-        [{Key, RoleIds}
-         || {{IndexType, Key}, RoleIds} <- erlang:get(),
-            IndexType =:= Type]).
 
 get_map_id() ->
     erlang:get(map_id).
