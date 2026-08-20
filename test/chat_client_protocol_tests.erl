@@ -77,3 +77,25 @@ channel_push_batch_rejects_invalid_boundaries_test() ->
         chat_client_protocol:decode_packet(
             <<?PROTO_CHANNEL_PUSH_BATCH:16, 1:16,
               Length:32, ChannelPush/binary, 0:8>>)).
+
+aoi_event_roundtrip_and_validation_test() ->
+    ?assertEqual(
+        {ok, {aoi_event, #{event => enter, role_id => 101}}},
+        chat_client_protocol:decode_packet(
+            chat_server_protocol:encode_aoi_event(enter, 101))),
+    ?assertEqual(
+        {ok, {aoi_event, #{event => leave, role_id => 102}}},
+        chat_client_protocol:decode_packet(
+            chat_server_protocol:encode_aoi_event(leave, 102))),
+    ?assertEqual(
+        {error, invalid_packet},
+        chat_client_protocol:decode_packet(
+            <<?PROTO_AOI_EVENT_PUSH:16, 3:8, 101:32>>)),
+    ?assertEqual(
+        {error, invalid_packet},
+        chat_client_protocol:decode_packet(
+            <<?PROTO_AOI_EVENT_PUSH:16, ?AOI_EVENT_ENTER:8, 101:32, 0:8>>)),
+    ?assertEqual(
+        {error, invalid_packet},
+        chat_client_protocol:decode_packet(
+            <<?PROTO_AOI_EVENT_PUSH:16, ?AOI_EVENT_ENTER:8, 101:24>>)).
