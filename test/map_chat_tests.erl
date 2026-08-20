@@ -19,8 +19,8 @@ map_chat_broadcasts_only_to_current_map_test_() ->
                  ?assertEqual({ok, {10, {10, 10}}},
                               map_server:join(Map10, 3, Role3, {10, 10})),
                  ?assertEqual(ok,
-                              map_server:send_map(
-                                  Map9, Role1, <<"alice">>, <<"hello">>)),
+                             map_server:send_map(
+                                  Map9, 100, <<"alice">>, <<"hello">>)),
                  assert_map_result(role1, Map9, send_map, {ok, 9}),
                  assert_map_chat(role1, 9, 100, <<"alice">>, <<"hello">>),
                  assert_map_chat(role2, 9, 100, <<"alice">>, <<"hello">>),
@@ -44,14 +44,12 @@ map_chat_rejects_non_member_test_() ->
                  ?assertEqual(
                      ok,
                      map_server:send_map(
-                         MapPid, RolePid, <<"unknown">>, <<"hello">>)),
-                 assert_map_result(
-                     non_member, MapPid, send_map, {error, not_in_map}),
+                         MapPid, 999, <<"unknown">>, <<"hello">>)),
                  ?assertEqual(timeout, receive_push(non_member, 100)),
                  ?assertEqual(
                      {error, map_unavailable},
                      map_server:send_map(
-                         undefined, RolePid, <<"unknown">>, <<"hello">>))
+                         undefined, 999, <<"unknown">>, <<"hello">>))
              after
                  stop_role_proxies([RolePid])
              end
@@ -72,15 +70,13 @@ map_chat_stops_after_leave_test_() ->
                  ?assertEqual({ok, {10, {11, 10}}},
                               map_server:join(MapPid, 2, Role2, {11, 10})),
                  ?assertEqual({ok, 10},
-                              map_server:leave(MapPid, Role2)),
+                              map_server:leave(MapPid, 2)),
                  ?assertEqual(ok,
-                              map_server:send_map(
-                                  MapPid, Role2, <<"bob">>, <<"left">>)),
-                 assert_map_result(
-                     role2, MapPid, send_map, {error, not_in_map}),
+                             map_server:send_map(
+                                  MapPid, 2, <<"bob">>, <<"left">>)),
                  ?assertEqual(ok,
-                              map_server:send_map(
-                                  MapPid, Role1, <<"alice">>, <<"still here">>)),
+                             map_server:send_map(
+                                  MapPid, 1, <<"alice">>, <<"still here">>)),
                  assert_map_result(role1, MapPid, send_map, {ok, 10}),
                  assert_map_chat(
                      role1, 10, 1, <<"alice">>, <<"still here">>),
@@ -103,12 +99,12 @@ map_chat_batches_packets_in_order_test_() ->
                               map_server:join(
                                   MapPid, 1, RolePid, {10, 10})),
                  ?assertEqual(ok,
-                              map_server:send_map(
-                                  MapPid, RolePid,
+                             map_server:send_map(
+                                  MapPid, 1,
                                   <<"alice">>, <<"first">>)),
                  ?assertEqual(ok,
-                              map_server:send_map(
-                                  MapPid, RolePid,
+                             map_server:send_map(
+                                  MapPid, 1,
                                   <<"alice">>, <<"second">>)),
                  assert_map_result(role1, MapPid, send_map, {ok, 10}),
                  assert_map_result(role1, MapPid, send_map, {ok, 10}),
@@ -138,15 +134,15 @@ role_down_removes_role_cell_and_shard_test_() ->
                  ?assertEqual({ok, {10, {11, 10}}},
                               map_server:join(MapPid, 2, Role2, {11, 10})),
                  exit(Role2, kill),
-                 State = wait_for_role_removed(MapPid, Role2, 50),
+                 State = wait_for_role_removed(MapPid, 2, 50),
                  Cells = maps:get(cells, State),
                  Shards = maps:get(shards, State),
-                 ?assertEqual(undefined, map_server:debug_role(MapPid, Role2)),
+                 ?assertEqual(undefined, map_server:debug_role(MapPid, 2)),
                  ?assertEqual(false, maps:is_key({11, 10}, Cells)),
-                 ?assertEqual([Role1], maps:get({5, 3}, Shards)),
+                 ?assertEqual([1], maps:get({5, 3}, Shards)),
                  ?assertEqual(ok,
-                              map_server:send_nearby(
-                                  MapPid, Role1, <<"alice">>, <<"nearby">>)),
+                             map_server:send_nearby(
+                                  MapPid, 1, <<"alice">>, <<"nearby">>)),
                  assert_map_result(role1, MapPid, send_nearby, {ok, 1})
              after
                  stop_role_proxies([Role1, Role2])
@@ -233,10 +229,6 @@ join_roles(MapPid, Roles) ->
 stop_roles(Roles) ->
     stop_role_proxies([RolePid || {_, _, RolePid} <- Roles]).
 
-role_pid(RoleId, Roles) ->
-    {RoleId, _, RolePid} = lists:keyfind(RoleId, 1, Roles),
-    RolePid.
-
 assert_nearby_case(MapPid, {SenderId, SenderPosition} = Sender,
                    Neighbors, {FarId, _} = Far) ->
     Nearby = [Sender | Neighbors],
@@ -245,7 +237,7 @@ assert_nearby_case(MapPid, {SenderId, SenderPosition} = Sender,
         join_roles(MapPid, Roles),
         ?assertEqual(ok,
                      map_server:send_nearby(
-                         MapPid, role_pid(SenderId, Roles),
+                         MapPid, SenderId,
                          <<"sender">>, <<"hello">>)),
         assert_map_result(
             SenderId, MapPid, send_nearby, {ok, length(Nearby)}),
@@ -326,13 +318,13 @@ receive_push_packets(Label, Timeout) ->
         timeout
     end.
 
-wait_for_role_removed(_MapPid, _RolePid, 0) ->
+wait_for_role_removed(_MapPid, _RoleId, 0) ->
     ?assert(false);
-wait_for_role_removed(MapPid, RolePid, Attempts) ->
-    case map_server:debug_role(MapPid, RolePid) of
+wait_for_role_removed(MapPid, RoleId, Attempts) ->
+    case map_server:debug_role(MapPid, RoleId) of
         undefined ->
             map_server:debug_state(MapPid);
         _RoleInfo ->
             receive after 10 -> ok end,
-            wait_for_role_removed(MapPid, RolePid, Attempts - 1)
+            wait_for_role_removed(MapPid, RoleId, Attempts - 1)
     end.

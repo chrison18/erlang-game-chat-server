@@ -181,7 +181,7 @@ handle_business_request({move, Direction}, Socket) ->
             send_packet(Socket,
                 chat_server_protocol:encode_move_result({error, not_in_map}));
         _MapId ->
-            case map_server:move(get(map_pid), self(), Direction) of
+            case map_server:move(get(map_pid), get(role_id), Direction) of
                 ok -> ok;
                 {error, map_unavailable} ->
                     send_packet(Socket,
@@ -196,7 +196,7 @@ handle_business_request({teleport, Position}, Socket) ->
                 chat_server_protocol:encode_teleport_result(
                     {error, not_in_map}));
         _MapId ->
-            case map_server:teleport(get(map_pid), self(), Position) of
+            case map_server:teleport(get(map_pid), get(role_id), Position) of
                 ok -> ok;
                 {error, map_unavailable} ->
                     send_packet(Socket,
@@ -212,7 +212,7 @@ handle_business_request({send_nearby, Content}, Socket) ->
                     {error, not_in_map}));
         _MapId ->
             case map_server:send_nearby(
-                     get(map_pid), self(), get(role_name), Content) of
+                     get(map_pid), get(role_id), get(role_name), Content) of
                 ok -> ok;
                 {error, map_unavailable} -> {error, map_unavailable}
             end
@@ -250,7 +250,7 @@ handle_business_request(leave_map, Socket) ->
         undefined ->
             {error, not_in_map};
         MapId ->
-            case map_server:leave(get(map_pid), self()) of
+            case map_server:leave(get(map_pid), get(role_id)) of
                 {ok, _MapId} = Result ->
                     erase(map_id),
                     erase(map_pid),
@@ -272,7 +272,7 @@ handle_business_request({send_map, Content}, Socket) ->
                     {error, not_in_map}));
         MapId ->
             case map_server:send_map(
-                     get(map_pid), self(), get(role_name), Content) of
+                     get(map_pid), get(role_id), get(role_name), Content) of
                 ok -> ok;
                 {error, map_unavailable} ->
                     send_packet(Socket,
